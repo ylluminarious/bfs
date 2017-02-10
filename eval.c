@@ -79,6 +79,70 @@ static const struct stat *fill_statbuf(struct eval_state *state) {
 	return ftwbuf->statbuf;
 }
 
+#if _POSIX_MONOTONIC_CLOCK > 0
+#	define BFS_CLOCK CLOCK_MONOTONIC
+#elif _POSIX_TIMERS > 0
+#	define BFS_CLOCK CLOCK_REALTIME
+#endif
+
+/**
+ * Call clock_gettime(), if available.
+ */
+static int eval_gettime(struct timespec *ts) {
+#ifdef BFS_CLOCK
+	int ret = clock_gettime(BFS_CLOCK, ts);
+	if (ret != 0) {
+		perror("clock_gettime()");
+	}
+	return ret;
+#else
+	return -1;
+#endif
+}
+
+/**
+ * Record the time that elapsed evaluating an expression.
+ */
+static void add_elapsed(struct expr *expr, const struct timespec *start, const struct timespec *end) {
+	expr->elapsed.tv_sec += end->tv_sec - start->tv_sec;
+	expr->elapsed.tv_nsec += end->tv_nsec - start->tv_nsec;
+	if (expr->elapsed.tv_nsec < 0) {
+		expr->elapsed.tv_nsec += 1000000000L;
+		--expr->elapsed.tv_sec;
+	} else if (expr->elapsed.tv_nsec >= 1000000000L) {
+		expr->elapsed.tv_nsec -= 1000000000L;
+		++expr->elapsed.tv_sec;
+	}
+}
+
+/**
+ * Evaluate an expression.
+ */
+static bool eval_expr(struct expr *expr, struct eval_state *state) {
+	struct timespec start, end;
+	bool time = state->cmdline->debug & DEBUG_RATES;
+	if (time) {
+		if (eval_gettime(&start) != 0) {
+			time = false;
+		}
+	}
+
+	bool ret = expr->eval(expr, state);
+
+	if (time) {
+		if (eval_gettime(&end) == 0) {
+			add_elapsed(expr, &start, &end);
+		}
+	}
+
+	++expr->evaluations;
+	if (ret) {
+		++expr->successes;
+	}
+
+	return ret;
+}
+
 /**
  * Get the difference (in seconds) between two struct timespecs.
  */
@@ -275,6 +339,18 @@ bool eval_delete(const struct expr *expr, struct eval_state *state) {
 	}
 
 	return true;
+}
+
+/**
+ * -exclude action.
+ */
+bool eval_exclude(const struct expr *expr, struct eval_state *state) {
+	if (eval_expr(expr->rhs, state)) {
+		eval_prune(expr, state);
+		return false;
+	} else {
+		return true;
+	}
 }
 
 static const char *exec_format_path(const struct expr *expr, const struct BFTW *ftwbuf) {
@@ -887,70 +963,6 @@ bool eval_xtype(const struct expr *expr, struct eval_state *state) {
 	}
 
 	return bftw_mode_to_typeflag(sb.st_mode) & expr->idata;
-}
-
-#if _POSIX_MONOTONIC_CLOCK > 0
-#	define BFS_CLOCK CLOCK_MONOTONIC
-#elif _POSIX_TIMERS > 0
-#	define BFS_CLOCK CLOCK_REALTIME
-#endif
-
-/**
- * Call clock_gettime(), if available.
- */
-static int eval_gettime(struct timespec *ts) {
-#ifdef BFS_CLOCK
-	int ret = clock_gettime(BFS_CLOCK, ts);
-	if (ret != 0) {
-		perror("clock_gettime()");
-	}
-	return ret;
-#else
-	return -1;
-#endif
-}
-
-/**
- * Record the time that elapsed evaluating an expression.
- */
-static void add_elapsed(struct expr *expr, const struct timespec *start, const struct timespec *end) {
-	expr->elapsed.tv_sec += end->tv_sec - start->tv_sec;
-	expr->elapsed.tv_nsec += end->tv_nsec - start->tv_nsec;
-	if (expr->elapsed.tv_nsec < 0) {
-		expr->elapsed.tv_nsec += 1000000000L;
-		--expr->elapsed.tv_sec;
-	} else if (expr->elapsed.tv_nsec >= 1000000000L) {
-		expr->elapsed.tv_nsec -= 1000000000L;
-		++expr->elapsed.tv_sec;
-	}
-}
-
-/**
- * Evaluate an expression.
- */
-static bool eval_expr(struct expr *expr, struct eval_state *state) {
-	struct timespec start, end;
-	bool time = state->cmdline->debug & DEBUG_RATES;
-	if (time) {
-		if (eval_gettime(&start) != 0) {
-			time = false;
-		}
-	}
-
-	bool ret = expr->eval(expr, state);
-
-	if (time) {
-		if (eval_gettime(&end) == 0) {
-			add_elapsed(expr, &start, &end);
-		}
-	}
-
-	++expr->evaluations;
-	if (ret) {
-		++expr->successes;
-	}
-
-	return ret;
 }
 
 /**

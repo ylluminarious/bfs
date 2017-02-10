@@ -312,6 +312,7 @@ bool eval_path(const struct expr *expr, struct eval_state *state);
 bool eval_regex(const struct expr *expr, struct eval_state *state);
 
 bool eval_delete(const struct expr *expr, struct eval_state *state);
+bool eval_exclude(const struct expr *expr, struct eval_state *state);
 bool eval_exec(const struct expr *expr, struct eval_state *state);
 bool eval_nohidden(const struct expr *expr, struct eval_state *state);
 bool eval_fprint(const struct expr *expr, struct eval_state *state);

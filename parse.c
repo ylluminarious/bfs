@@ -2130,6 +2130,7 @@ static struct expr *new_not_expr(const struct parser_state *state, struct expr *
 /**
  * FACTOR : "(" EXPR ")"
  *        | "!" FACTOR | "-not" FACTOR
+ *        | "-exclude" FACTOR
  *        | LITERAL
  */
 static struct expr *parse_factor(struct parser_state *state) {
@@ -2174,6 +2175,15 @@ static struct expr *parse_factor(struct parser_state *state) {
 		}
 
 		return new_not_expr(state, factor, argv);
+	} else if (strcmp(arg, "-exclude") == 0) {
+		char **argv = parser_advance(state, T_ACTION, 1);
+
+		struct expr *factor = parse_factor(state);
+		if (!factor) {
+			return NULL;
+		}
+
+		return new_unary_expr(eval_exclude, factor, argv);
 	} else {
 		return parse_literal(state);
 	}
