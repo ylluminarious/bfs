@@ -2,28 +2,18 @@ language: c
 
 script: make check
 
-matrix:
-  include:
-    - os: linux
-      dist: trusty
-      sudo: false
-      compiler: gcc
+env:
+  global:
+    - secure: "GxXjKNMAIn66OKTAfImbhS/XGxopaKPJ2bVyRgoFN4t58DyRJPk4tbm8wCjJe/Pngti+Wl+5+OvTL8JDqmvGWBtOA6+7oVKlCRDAAS7UdoYCAmEj7WTLhqe9g5si9ZVjBOAOqKtCYNVnySkizJf2TRPOHsoOgYUGz8BQCYc5FzgbE15b9jxCsYYqi1DkPHhmwFP2szMGCbHIpT0tnnbGDj++sJOhBVFf9aAQeWsYsEHCQQwJOQInj7K3LehR3CBtso+MWJCyo33KfX+JDZEHcDX6nMK5or6ObsPhIA6ySvDksUksq5/pUWTSF3blcp0V8xZBvRwaZMfuhbe5ilVfCicEV6KzoR3yPD1kLTPw6iLmipn+otDKduKKUGA2Dd0W4QzqFOHEtTzk1S8U/JXruUKOLnMSyepT5I30S/Me9/ZNQW4fEUbw2ZwDHE5fayqaMxzXFGvCfS384Qp5Hd0hwxCA+3oW8M++YIxUJ+hc8OB4XkTBkGieVNXCkLN8WJcw9zikDqOGKQrj+LND4A0hzZYy/gcBJRjZ17i5dy1jCOct29ddYl7ALRoguja6ShCLaLwf28m5+5VXRUa0FZVTswRBhjBs/ozYZsKyjit4uKNBI49ISBm/pja0GZbc5nbRqzhfTU7XFKQxAQfihnPIrnyyG9xKN9ggvPgRDeEza6A="
 
-    - os: linux
-      dist: trusty
-      sudo: false
-      compiler: gcc
-      env:
-        - CFLAGS="-m32 -g -Wall"
-      addons:
-        apt:
-          packages:
-            - gcc-multilib
+before_install:
+  - echo -n | openssl s_client -connect scan.coverity.com:443 | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' | sudo tee -a /etc/ssl/certs/ca-
 
-    - os: linux
-      dist: trusty
-      sudo: false
-      compiler: clang
-
-    - os: osx
-      compiler: clang
+addons:
+  coverity_scan:
+    project:
+      name: "tavianator/bfs"
+      description: "Build submitted via Travis CI"
+    notification_email: tavianator@tavianator.com
+    build_command: "make"
+    branch_pattern: coverity
