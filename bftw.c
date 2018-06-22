@@ -42,11 +42,72 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static int bftw_mutex_lock(pthread_mutex_t *mutex) {
+	int ret = pthread_mutex_lock(mutex);
+	assert(ret == 0);
+	return ret;
+}
+
+static int bftw_mutex_unlock(pthread_mutex_t *mutex) {
+	int ret = pthread_mutex_unlock(mutex);
+	assert(ret == 0);
+	return ret;
+}
+
+static int bftw_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
+	int ret = pthread_cond_wait(cond, mutex);
+
+	if (ret != 0) {
+		assert(false);
+		bftw_mutex_unlock(mutex);
+		bftw_mutex_lock(mutex);
+	}
+
+	return ret;
+}
+
+static int bftw_cond_signal(pthread_cond_t *cond) {
+	int ret = pthread_cond_signal(cond);
+	assert(ret == 0);
+	return ret;
+}
+
+static int bftw_cond_broadcast(pthread_cond_t *cond) {
+	int ret = pthread_cond_broadcast(cond);
+	assert(ret == 0);
+	return ret;
+}
+
+static int bftw_rwlock_rdlock(pthread_rwlock_t *rwlock) {
+	int ret = pthread_rwlock_rdlock(rwlock);
+	assert(ret == 0);
+	return ret;
+}
+
+static int bftw_rwlock_wrlock(pthread_rwlock_t *rwlock) {
+	int ret = pthread_rwlock_wrlock(rwlock);
+	assert(ret == 0);
+	return ret;
+}
+
+static int bftw_rwlock_unlock(pthread_rwlock_t *rwlock) {
+	int ret = pthread_rwlock_unlock(rwlock);
+	assert(ret == 0);
+	return ret;
+}
+
+static int bftw_join(pthread_t thread, void **retval) {
+	int ret = pthread_join(thread, retval);
+	assert(ret == 0);
+	return ret;
+}
 
 /**
  * A directory.
@@ -91,6 +152,9 @@ struct bftw_cache {
 	size_t size;
 	/** Maximum heap size. */
 	size_t capacity;
+
+	/** Lock protecting the cache from concurrent modification. */
+	pthread_rwlock_t rwlock;
 };
 
 /** Initialize a cache. */
@@ -102,12 +166,19 @@ static int bftw_cache_init(struct bftw_cache *cache, size_t capacity) {
 
 	cache->size = 0;
 	cache->capacity = capacity;
+
+	if (pthread_rwlock_init(&cache->rwlock, NULL) != 0) {
+		free(cache->heap);
+		return -1;
+	}
+
 	return 0;
 }
 
 /** Destroy a cache. */
 static void bftw_cache_destroy(struct bftw_cache *cache) {
 	assert(cache->size == 0);
+	pthread_rwlock_destroy(&cache->rwlock);
 	free(cache->heap);
 }
 
@@ -303,7 +374,10 @@ static struct bftw_dir *bftw_dir_new(struct bftw_cache *cache, struct bftw_dir *
 	if (parent) {
 		dir->depth = parent->depth + 1;
 		dir->nameoff = parent->nameoff + parent->namelen;
+
+		bftw_rwlock_wrlock(&cache->rwlock);
 		bftw_dir_incref(cache, parent);
+		bftw_rwlock_unlock(&cache->rwlock);
 	} else {
 		dir->depth = 0;
 		dir->nameoff = 0;
@@ -351,13 +425,17 @@ static int bftw_dir_path(const struct bftw_dir *dir, char **path) {
  *
  * @param dir
  *         The directory being accessed.
+ * @param path
+ *         The full path to that directory.
  * @param[out] at_fd
  *         Will hold the appropriate file descriptor to use.
  * @param[in,out] at_path
  *         Will hold the appropriate path to use.
  * @return The closest open ancestor file.
  */
-static struct bftw_dir *bftw_dir_base(struct bftw_dir *dir, int *at_fd, const char **at_path) {
+static struct bftw_dir *bftw_dir_base(struct bftw_dir *dir, const char *path, int *at_fd, const char **at_path) {
+	// XXX: Don't take at_fd?  It's just base ? AT_FDCWD : base->fd
+
 	struct bftw_dir *base = dir;
 
 	do {
@@ -366,7 +444,10 @@ static struct bftw_dir *bftw_dir_base(struct bftw_dir *dir, int *at_fd, const ch
 
 	if (base) {
 		*at_fd = base->fd;
-		*at_path += base->nameoff + base->namelen;
+		*at_path = path + base->nameoff + base->namelen;
+	} else {
+		*at_fd = AT_FDCWD;
+		*at_path = path;
 	}
 
 	return base;
@@ -381,22 +462,35 @@ static struct bftw_dir *bftw_dir_base(struct bftw_dir *dir, int *at_fd, const ch
  *         The directory to open.
  * @param base
  *         The base directory for the relative path (may be NULL).
- * @param at_fd
- *         The base file descriptor, AT_FDCWD if base == NULL.
  * @param at_path
- *         The relative path to the dir.
+ *         The relative path to base.
+ * @param exclusive
+ *         Whether cache->rwlock is already locked in exclusive (write) mode.  If
+ *         it isn't, it must be read-locked.  Then this function will unlock it
+ *         and acquire a write lock during its operation.
  * @return
  *         The opened file descriptor, or negative on error.
  */
-static int bftw_dir_openat(struct bftw_cache *cache, struct bftw_dir *dir, const struct bftw_dir *base, int at_fd, const char *at_path) {
+static int bftw_dir_openat(struct bftw_cache *cache, struct bftw_dir *dir, const struct bftw_dir *base, const char *at_path, bool exclusive) {
 	assert(dir->fd < 0);
 
+	int at_fd = base ? base->fd : AT_FDCWD;
 	int flags = O_RDONLY | O_CLOEXEC | O_DIRECTORY;
 	int fd = openat(at_fd, at_path, flags);
+	int error = errno;
 
-	if (fd < 0 && errno == EMFILE) {
+	if (!exclusive) {
+		bftw_rwlock_unlock(&cache->rwlock);
+		bftw_rwlock_wrlock(&cache->rwlock);
+	}
+
+	// XXX: There should not be races to open the same directory?
+	assert(dir->fd < 0);
+
+	if (fd < 0 && error == EMFILE && base && base->fd >= 0) {
 		if (bftw_cache_shrink(cache, base) == 0) {
 			fd = openat(base->fd, at_path, flags);
+			error = errno;
 		}
 	}
 
@@ -409,11 +503,15 @@ static int bftw_dir_openat(struct bftw_cache *cache, struct bftw_dir *dir, const
 		bftw_cache_add(cache, dir);
 	}
 
+	errno = error;
 	return fd;
 }
 
 /**
  * Open a bftw_dir.
+ *
+ * This function should be called with cache->rwlock read-locked.  It returns
+ * with cache->rwlock write-locked!
  *
  * @param cache
  *         The cache containing the directory.
@@ -425,16 +523,31 @@ static int bftw_dir_openat(struct bftw_cache *cache, struct bftw_dir *dir, const
  *         The opened file descriptor, or negative on error.
  */
 static int bftw_dir_open(struct bftw_cache *cache, struct bftw_dir *dir, const char *path) {
-	int at_fd = AT_FDCWD;
-	const char *at_path = path;
-	struct bftw_dir *base = bftw_dir_base(dir, &at_fd, &at_path);
+	int at_fd;
+	const char *at_path;
+	struct bftw_dir *base = bftw_dir_base(dir, path, &at_fd, &at_path);
 
-	int fd = bftw_dir_openat(cache, dir, base, at_fd, at_path);
+	int fd = bftw_dir_openat(cache, dir, base, at_path, false);
+
+	if (fd < 0 && errno == EMFILE) {
+		// bftw_dir_openat() has already tried to handle EMFILE if it
+		// could, but base may have been closed in the meantime, or we
+		// may need to close it and try a different base
+		if (bftw_cache_shrink(cache, NULL) == 0) {
+			base = bftw_dir_base(dir, path, &at_fd, &at_path);
+			fd = bftw_dir_openat(cache, dir, base, at_path, true);
+		}
+	}
+
 	if (fd >= 0 || errno != ENAMETOOLONG) {
 		return fd;
 	}
 
 	// Handle ENAMETOOLONG by manually traversing the path component-by-component
+
+	if (base && base->fd < 0) {
+		base = bftw_dir_base(dir, path, &at_fd, &at_path);
+	}
 
 	// -1 to include the root, which has depth == 0
 	size_t offset = base ? base->depth : -1;
@@ -455,13 +568,12 @@ static int bftw_dir_open(struct bftw_cache *cache, struct bftw_dir *dir, const c
 	}
 
 	for (size_t i = 0; i < levels; ++i) {
-		fd = bftw_dir_openat(cache, parents[i], base, at_fd, parents[i]->name);
+		fd = bftw_dir_openat(cache, parents[i], base, parents[i]->name, true);
 		if (fd < 0) {
 			break;
 		}
 
 		base = parents[i];
-		at_fd = fd;
 	}
 
 	free(parents);
@@ -481,8 +593,16 @@ static int bftw_dir_open(struct bftw_cache *cache, struct bftw_dir *dir, const c
  *         The opened DIR *, or NULL on error.
  */
 static DIR *bftw_dir_opendir(struct bftw_cache *cache, struct bftw_dir *dir, const char *path) {
+	if (bftw_rwlock_rdlock(&cache->rwlock) != 0) {
+		return NULL;
+	}
+
+	int error;
 	int fd = bftw_dir_open(cache, dir, path);
 	if (fd < 0) {
+		error = errno;
+		bftw_rwlock_unlock(&cache->rwlock);
+		errno = error;
 		return NULL;
 	}
 
@@ -499,13 +619,18 @@ static DIR *bftw_dir_opendir(struct bftw_cache *cache, struct bftw_dir *dir, con
 		}
 	}
 
+	// Unlock here since fdopendir() may do I/O
+	error = errno;
+	bftw_rwlock_unlock(&cache->rwlock);
+
 	if (dfd < 0) {
+		errno = error;
 		return NULL;
 	}
 
 	DIR *ret = fdopendir(dfd);
 	if (!ret) {
-		int error = errno;
+		error = errno;
 		close(dfd);
 		errno = error;
 	}
@@ -517,9 +642,11 @@ static DIR *bftw_dir_opendir(struct bftw_cache *cache, struct bftw_dir *dir, con
 static void bftw_dir_free(struct bftw_cache *cache, struct bftw_dir *dir) {
 	assert(dir->refcount == 0);
 
+	bftw_rwlock_wrlock(&cache->rwlock);
 	if (dir->fd >= 0) {
 		bftw_dir_close(cache, dir);
 	}
+	bftw_rwlock_unlock(&cache->rwlock);
 
 	free(dir);
 }
@@ -528,6 +655,9 @@ static void bftw_dir_free(struct bftw_cache *cache, struct bftw_dir *dir) {
  * A directory reader.
  */
 struct bftw_reader {
+	/** The next reader in the chain. */
+	struct bftw_reader *next;
+
 	/** The directory object. */
 	struct bftw_dir *dir;
 	/** The path to the directory. */
@@ -538,20 +668,30 @@ struct bftw_reader {
 	struct dirent *de;
 	/** Any error code that has occurred. */
 	int error;
+	/** Whether this reader is ready to be accessed by the main thread. */
+	bool ready;
 };
 
-/** Initialize a reader. */
-static int bftw_reader_init(struct bftw_reader *reader) {
-	reader->path = dstralloc(0);
-	if (!reader->path) {
-		return -1;
+/** Create a reader. */
+static struct bftw_reader *bftw_reader_new(void) {
+	struct bftw_reader *reader = malloc(sizeof(*reader));
+	if (!reader) {
+		return NULL;
 	}
 
+	reader->path = dstralloc(0);
+	if (!reader->path) {
+		free(reader);
+		return NULL;
+	}
+
+	reader->next = NULL;
 	reader->dir = NULL;
 	reader->handle = NULL;
 	reader->de = NULL;
 	reader->error = 0;
-	return 0;
+	reader->ready = false;
+	return reader;
 }
 
 /** Read a directory entry. */
@@ -564,26 +704,27 @@ static int bftw_reader_read(struct bftw_reader *reader) {
 	return 0;
 }
 
+// XXX: HACK
+static struct bftw_cache *global_cache;
+
 /** Open a directory for reading. */
-static int bftw_reader_open(struct bftw_reader *reader, struct bftw_cache *cache, struct bftw_dir *dir) {
+static int bftw_reader_open(struct bftw_reader *reader) {
 	assert(!reader->handle);
-	assert(!reader->de);
 
-	reader->dir = dir;
-	reader->error = 0;
-
-	if (bftw_dir_path(dir, &reader->path) != 0) {
+	if (bftw_dir_path(reader->dir, &reader->path) != 0) {
+		// XXX: Make sure dstrlen(reader->path) == 0
 		reader->error = errno;
-		dstresize(&reader->path, 0);
 		return -1;
 	}
 
-	reader->handle = bftw_dir_opendir(cache, dir, reader->path);
+	reader->handle = bftw_dir_opendir(global_cache, reader->dir, reader->path);
 	if (!reader->handle) {
 		reader->error = errno;
 		return -1;
 	}
 
+	// Read the first entry as soon as we open the directory, so that we can
+	// parallelize both opening and reading
 	return bftw_reader_read(reader);
 }
 
@@ -603,13 +744,26 @@ static int bftw_reader_close(struct bftw_reader *reader) {
 	return ret;
 }
 
-/** Destroy a reader. */
-static void bftw_reader_destroy(struct bftw_reader *reader) {
+/** Refresh a reader before reading a new directory. */
+static void bftw_reader_refresh(struct bftw_reader *reader) {
+	assert(reader->next == NULL);
+	assert(reader->handle == NULL);
+	assert(reader->de == NULL);
+
+	reader->dir = NULL;
+	dstresize(&reader->path, 0);
+	reader->error = 0;
+	reader->ready = false;
+}
+
+/** Free a reader. */
+static void bftw_reader_free(struct bftw_reader *reader) {
 	if (reader->handle) {
 		bftw_reader_close(reader);
 	}
 
 	dstrfree(reader->path);
+	free(reader);
 }
 
 /**
@@ -618,27 +772,214 @@ static void bftw_reader_destroy(struct bftw_reader *reader) {
 struct bftw_queue {
 	/** The head of the queue. */
 	struct bftw_dir *head;
+	/** The next directory to read (in the background). */
+	struct bftw_dir *next;
 	/** The tail of the queue. */
 	struct bftw_dir *tail;
+
+	/** Chain of readers in the same order is the main queue. */
+	struct bftw_reader *read_head;
+	/** Tail of the reader chain. */
+	struct bftw_reader *read_tail;
+	/** Chain of readers waiting to be used. */
+	struct bftw_reader *read_next;
+	/** Whether the background readers should stay alive. */
+	bool alive;
+
+	/** Mutex guarding this queue. */
+	pthread_mutex_t mutex;
+	/** Condition variable to wake the main thread. */
+	pthread_cond_t fg_cond;
+	/** Condition variable to wake reader threads. */
+	pthread_cond_t bg_cond;
+
+	/** The number of background threads. */
+	unsigned int nthreads;
+	/** The background threads themselves. */
+	pthread_t *threads;
 };
 
+/** Start reading the next directory from the queue. */
+static struct bftw_reader *bftw_queue_read(struct bftw_queue *queue) {
+	assert(queue->next);
+	assert(queue->read_next);
+
+	struct bftw_reader *reader = queue->read_next;
+	queue->read_next = reader->next;
+	reader->next = NULL;
+
+	reader->dir = queue->next;
+	queue->next = reader->dir->next;
+
+	return reader;
+}
+
+/** Background thread function. */
+static void *bftw_reader_thread(void *ptr) {
+	struct bftw_queue *queue = ptr;
+
+	if (bftw_mutex_lock(&queue->mutex) != 0) {
+		return NULL;
+	}
+
+	while (queue->alive) {
+		while (!queue->next || !queue->read_next) {
+			bftw_cond_wait(&queue->bg_cond, &queue->mutex);
+			if (!queue->alive) {
+				goto done;
+			}
+		}
+
+		struct bftw_reader *reader = bftw_queue_read(queue);
+
+		if (!queue->read_head) {
+			queue->read_head = reader;
+		}
+		if (queue->read_tail) {
+			queue->read_tail->next = reader;
+		}
+		queue->read_tail = reader;
+
+		bftw_mutex_unlock(&queue->mutex);
+		bftw_reader_open(reader);
+		bftw_mutex_lock(&queue->mutex);
+
+		reader->ready = true;
+		if (reader == queue->read_head) {
+			bftw_cond_signal(&queue->fg_cond);
+		}
+	}
+
+done:
+	bftw_mutex_unlock(&queue->mutex);
+
+	return NULL;
+}
+
+/** Stop and join the background threads. */
+static void bftw_queue_join(struct bftw_queue *queue) {
+	bftw_mutex_lock(&queue->mutex);
+
+	assert(queue->alive);
+	queue->alive = false;
+	bftw_cond_broadcast(&queue->bg_cond);
+
+	bftw_mutex_unlock(&queue->mutex);
+
+	for (unsigned int i = 0; i < queue->nthreads; ++i) {
+		bftw_join(queue->threads[i], NULL);
+	}
+}
+
+/** Free a chain of readers. */
+// XXX: Name?
+static void bftw_free_readers(struct bftw_reader *reader) {
+	while (reader) {
+		struct bftw_reader *next = reader->next;
+		bftw_reader_free(reader);
+		reader = next;
+	}
+}
+
 /** Initialize a bftw_queue. */
-static void bftw_queue_init(struct bftw_queue *queue) {
+static int bftw_queue_init(struct bftw_queue *queue) {
 	queue->head = NULL;
+	queue->next = NULL;
 	queue->tail = NULL;
+
+	queue->read_head = NULL;
+	queue->read_tail = NULL;
+	queue->read_next = NULL;
+	queue->alive = true;
+
+	unsigned int nthreads = 1; // XXX
+	unsigned int nreaders = nthreads + 1;
+	for (unsigned int i = 0; i < nreaders; ++i) {
+		struct bftw_reader *reader = bftw_reader_new();
+		if (!reader) {
+			goto fail_readers;
+		}
+		reader->next = queue->read_next;
+		queue->read_next = reader;
+	}
+
+	if (pthread_mutex_init(&queue->mutex, NULL) != 0) {
+		goto fail_readers;
+	}
+	if (pthread_cond_init(&queue->fg_cond, NULL) != 0) {
+		goto fail_mutex;
+	}
+	if (pthread_cond_init(&queue->bg_cond, NULL) != 0) {
+		goto fail_fg_cond;
+	}
+
+	queue->threads = malloc(nthreads*sizeof(*queue->threads));
+	if (!queue->threads) {
+		goto fail_bg_cond;
+	}
+
+	queue->nthreads = 0;
+	for (unsigned int i = 0; i < nthreads; ++i) {
+		if (pthread_create(queue->threads + i, NULL, bftw_reader_thread, queue) != 0) {
+			goto fail_threads;
+		}
+		++queue->nthreads;
+	}
+
+	return 0;
+
+fail_threads:
+	bftw_queue_join(queue);
+	free(queue->threads);
+fail_bg_cond:
+	pthread_cond_destroy(&queue->bg_cond);
+fail_fg_cond:
+	pthread_cond_destroy(&queue->fg_cond);
+fail_mutex:
+	pthread_mutex_destroy(&queue->mutex);
+fail_readers:
+	bftw_free_readers(queue->read_next);
+	return -1;
+}
+
+/** Destroy a bftw_queue. */
+static void bftw_queue_destroy(struct bftw_queue *queue) {
+	assert(queue->head == NULL);
+	assert(queue->tail == NULL);
+	assert(!queue->alive);
+
+	free(queue->threads);
+
+	pthread_cond_destroy(&queue->bg_cond);
+	pthread_cond_destroy(&queue->fg_cond);
+	pthread_mutex_destroy(&queue->mutex);
+
+	bftw_free_readers(queue->read_head);
+	bftw_free_readers(queue->read_next);
 }
 
 /** Add a directory to the bftw_queue. */
 static void bftw_queue_push(struct bftw_queue *queue, struct bftw_dir *dir) {
+	bftw_mutex_lock(&queue->mutex);
+
 	assert(dir->next == NULL);
 
 	if (!queue->head) {
 		queue->head = dir;
 	}
+	if (!queue->next) {
+		queue->next = dir;
+	}
 	if (queue->tail) {
 		queue->tail->next = dir;
 	}
 	queue->tail = dir;
+
+	if (queue->read_next) {
+		bftw_cond_signal(&queue->bg_cond);
+	}
+
+	bftw_mutex_unlock(&queue->mutex);
 }
 
 /** Pop the next directory from the queue. */
@@ -650,6 +991,49 @@ static struct bftw_dir *bftw_queue_pop(struct bftw_queue *queue) {
 	}
 	dir->next = NULL;
 	return dir;
+}
+
+/** Pop the next directory and start reading it. */
+static struct bftw_reader *bftw_queue_poll(struct bftw_queue *queue) {
+	bftw_mutex_lock(&queue->mutex);
+
+	while (!queue->read_head || !queue->read_head->ready) {
+		if (!queue->read_head && queue->read_next) {
+			// We can open it ourselves without waiting for a
+			// background thread
+			struct bftw_reader *reader = bftw_queue_read(queue);
+			bftw_queue_pop(queue);
+			bftw_mutex_unlock(&queue->mutex);
+			bftw_reader_open(reader);
+			return reader;
+		} else {
+			bftw_cond_wait(&queue->fg_cond, &queue->mutex);
+		}
+	}
+
+	struct bftw_reader *reader = queue->read_head;
+	queue->read_head = reader->next;
+	if (queue->read_tail == reader) {
+		queue->read_tail = NULL;
+	}
+	reader->next = NULL;
+
+	bftw_queue_pop(queue);
+	bftw_mutex_unlock(&queue->mutex);
+	return reader;
+}
+
+/** Return a reader to the queue. */
+// XXX: Name?
+static void bftw_queue_done_reading(struct bftw_queue *queue, struct bftw_reader *reader) {
+	bftw_reader_refresh(reader);
+
+	bftw_mutex_lock(&queue->mutex);
+
+	reader->next = queue->read_next;
+	queue->read_next = reader;
+
+	bftw_mutex_unlock(&queue->mutex);
 }
 
 /** Call stat() and use the results. */
@@ -682,7 +1066,7 @@ struct bftw_state {
 	struct bftw_queue queue;
 
 	/** The reader for the current directory. */
-	struct bftw_reader reader;
+	struct bftw_reader *reader;
 	/** Whether the current visit is pre- or post-order. */
 	enum bftw_visit visit;
 
@@ -708,27 +1092,27 @@ static int bftw_state_init(struct bftw_state *state, const char *root, bftw_fn *
 
 	if (nopenfd < 2) {
 		errno = EMFILE;
-		goto err;
+		return -1;
 	}
 
 	// -1 to account for dup()
 	if (bftw_cache_init(&state->cache, nopenfd - 1) != 0) {
-		goto err;
+		goto fail;
+	}
+	global_cache = &state->cache;
+
+	if (bftw_queue_init(&state->queue) != 0) {
+		goto fail_cache;
 	}
 
-	bftw_queue_init(&state->queue);
-
-	if (bftw_reader_init(&state->reader) != 0) {
-		goto err_cache;
-	}
-
+	state->reader = NULL;
 	state->visit = BFTW_PRE;
 
 	return 0;
 
-err_cache:
+fail_cache:
 	bftw_cache_destroy(&state->cache);
-err:
+fail:
 	return -1;
 }
 
@@ -736,7 +1120,7 @@ err:
  * Update the path for the current file.
  */
 static int bftw_update_path(struct bftw_state *state) {
-	struct bftw_reader *reader = &state->reader;
+	struct bftw_reader *reader = state->reader;
 	struct bftw_dir *dir = reader->dir;
 	struct dirent *de = reader->de;
 
@@ -770,15 +1154,15 @@ static int bftw_update_path(struct bftw_state *state) {
  * Initialize the buffers with data about the current path.
  */
 static void bftw_prepare_visit(struct bftw_state *state) {
-	struct bftw_reader *reader = &state->reader;
-	struct bftw_dir *dir = reader->dir;
-	struct dirent *de = reader->de;
+	struct bftw_reader *reader = state->reader;
+	struct bftw_dir *dir = reader ? reader->dir : NULL;
+	struct dirent *de = reader ? reader->de : NULL;
 
 	struct BFTW *ftwbuf = &state->ftwbuf;
-	ftwbuf->path = dir ? reader->path : state->root;
+	ftwbuf->path = reader ? reader->path : state->root;
 	ftwbuf->root = state->root;
 	ftwbuf->depth = 0;
-	ftwbuf->error = reader->error;
+	ftwbuf->error = reader ? reader->error : 0;
 	ftwbuf->visit = state->visit;
 	ftwbuf->statbuf = NULL;
 	ftwbuf->at_fd = AT_FDCWD;
@@ -793,10 +1177,11 @@ static void bftw_prepare_visit(struct bftw_state *state) {
 			ftwbuf->nameoff += dir->namelen;
 			++ftwbuf->depth;
 
-			ftwbuf->at_fd = dir->fd;
+			ftwbuf->at_fd = dirfd(reader->handle);
 			ftwbuf->at_path += ftwbuf->nameoff;
 		} else {
-			bftw_dir_base(dir, &ftwbuf->at_fd, &ftwbuf->at_path);
+			// XXX: A race may close this
+			bftw_dir_base(dir, ftwbuf->path, &ftwbuf->at_fd, &ftwbuf->at_path);
 		}
 	}
 
@@ -857,7 +1242,7 @@ static void bftw_prepare_visit(struct bftw_state *state) {
  * Invoke the callback.
  */
 static int bftw_visit_path(struct bftw_state *state) {
-	if (state->reader.dir) {
+	if (state->reader) {
 		if (bftw_update_path(state) != 0) {
 			state->error = errno;
 			return BFTW_STOP;
@@ -893,7 +1278,11 @@ static int bftw_visit_path(struct bftw_state *state) {
  * Push a new directory onto the queue.
  */
 static int bftw_push(struct bftw_state *state, const char *name) {
-	struct bftw_dir *parent = state->reader.dir;
+	struct bftw_dir *parent = NULL;
+	if (state->reader) {
+		parent = state->reader->dir;
+	}
+
 	struct bftw_dir *dir = bftw_dir_new(&state->cache, parent, name);
 	if (!dir) {
 		state->error = errno;
@@ -911,16 +1300,6 @@ static int bftw_push(struct bftw_state *state, const char *name) {
 }
 
 /**
- * Pop a directory from the queue and start reading it.
- */
-static struct bftw_reader *bftw_pop(struct bftw_state *state) {
-	struct bftw_reader *reader = &state->reader;
-	struct bftw_dir *dir = bftw_queue_pop(&state->queue);
-	bftw_reader_open(reader, &state->cache, dir);
-	return reader;
-}
-
-/**
  * Finalize and free a directory we're done with.
  */
 static int bftw_release_dir(struct bftw_state *state, struct bftw_dir *dir, bool do_visit) {
@@ -933,13 +1312,16 @@ static int bftw_release_dir(struct bftw_state *state, struct bftw_dir *dir, bool
 	state->visit = BFTW_POST;
 
 	while (dir) {
+		bftw_rwlock_wrlock(&state->cache.rwlock);
 		bftw_dir_decref(&state->cache, dir);
+		bftw_rwlock_unlock(&state->cache.rwlock);
+
 		if (dir->refcount > 0) {
 			break;
 		}
 
 		if (do_visit) {
-			state->reader.dir = dir;
+			state->reader->dir = dir;
 			if (bftw_visit_path(state) == BFTW_STOP) {
 				ret = BFTW_STOP;
 				do_visit = false;
@@ -961,7 +1343,7 @@ static int bftw_release_dir(struct bftw_state *state, struct bftw_dir *dir, bool
 static int bftw_release_reader(struct bftw_state *state, bool do_visit) {
 	int ret = BFTW_CONTINUE;
 
-	struct bftw_reader *reader = &state->reader;
+	struct bftw_reader *reader = state->reader;
 	if (reader->handle) {
 		bftw_reader_close(reader);
 	}
@@ -982,7 +1364,8 @@ static int bftw_release_reader(struct bftw_state *state, bool do_visit) {
 		ret = BFTW_STOP;
 	}
 
-	reader->dir = NULL;
+	bftw_queue_done_reading(&state->queue, reader);
+	state->reader = NULL;
 
 	return ret;
 }
@@ -994,17 +1377,16 @@ static int bftw_release_reader(struct bftw_state *state, bool do_visit) {
  *         The bftw() return value.
  */
 static int bftw_state_destroy(struct bftw_state *state) {
-	struct bftw_reader *reader = &state->reader;
-	if (reader->dir) {
+	if (state->reader) {
 		bftw_release_reader(state, false);
 	}
-	bftw_reader_destroy(reader);
 
 	struct bftw_queue *queue = &state->queue;
+	bftw_queue_join(&state->queue);
 	while (queue->head) {
-		struct bftw_dir *dir = bftw_queue_pop(queue);
-		bftw_release_dir(state, dir, false);
+		bftw_release_dir(state, bftw_queue_pop(queue), false);
 	}
+	bftw_queue_destroy(queue);
 
 	bftw_cache_destroy(&state->cache);
 
@@ -1040,9 +1422,10 @@ int bftw(const char *path, bftw_fn *fn, int nopenfd, enum bftw_flags flags, void
 	}
 
 	while (state.queue.head) {
-		struct bftw_reader *reader = bftw_pop(&state);
+		state.reader = bftw_queue_poll(&state.queue);
+		struct bftw_reader *reader = state.reader;
 
-		while (reader->de) {
+		while (reader->de && reader->error == 0) {
 			const char *name = reader->de->d_name;
 			if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) {
 				goto read;

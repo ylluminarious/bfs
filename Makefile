@@ -43,7 +43,7 @@ LOCAL_CPPFLAGS := \
     -D_GNU_SOURCE \
     -DBFS_VERSION=\"$(VERSION)\"
 
-LOCAL_CFLAGS := -std=c99
+LOCAL_CFLAGS := -std=c99 -pthread
 
 ALL_CPPFLAGS = $(LOCAL_CPPFLAGS) $(CPPFLAGS)
 ALL_CFLAGS = $(ALL_CPPFLAGS) $(LOCAL_CFLAGS) $(CFLAGS) $(DEPFLAGS)
@@ -54,10 +54,13 @@ all: bfs
 bfs: bftw.o color.o dstring.o eval.o exec.o main.o mtab.o opt.o parse.o printf.o stat.o typo.o util.o
 	$(CC) $(ALL_LDFLAGS) $^ -o $@
 
-sanitized: CFLAGS := -g $(WFLAGS) -fsanitize=address -fsanitize=undefined
-sanitized: bfs
+ubsan: CFLAGS := -g $(WFLAGS) -fsanitize=address -fsanitize=undefined
+ubsan: bfs
 
-release: CFLAGS := -g $(WFLAGS) -O3 -flto -DNDEBUG
+tsan: CFLAGS := -g $(WFLAGS) -fsanitize=thread
+tsan: bfs
+
+release: CFLAGS := -g $(WFLAGS) -O3 -flto -DNDEBUG -rdynamic
 release: bfs
 
 %.o: %.c
