@@ -15,18 +15,37 @@
  ****************************************************************************/
 
 #include "mtab.h"
+#include "util.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#if __GLIBC__
-#	include <mntent.h>
+#ifndef __has_include
+#	define __has_include(header) 0
+#endif
+
+#if __GLIBC__ || __has_include(<mntent.h>)
+#	define BFS_MNTENT 1
 #elif BSD
+#	define BFS_MNTINFO 1
+#elif __SVR4
+#	define BFS_MNTTAB 1
+#endif
+
+#if BFS_MNTENT
+#	include <mntent.h>
+#	include <paths.h>
+#	include <stdio.h>
+#elif BFS_MNTINFO
 #	include <sys/mount.h>
 #	include <sys/ucred.h>
+#elif BFS_MNTTAB
+#	include <stdio.h>
+#	include <sys/mnttab.h>
 #endif
 
 /**
@@ -76,9 +95,13 @@ static int bfs_mtab_push(struct bfs_mtab *mtab, dev_t dev, const char *type) {
 }
 
 struct bfs_mtab *parse_bfs_mtab() {
-#if __GLIBC__
+#if BFS_MNTENT
 
 	FILE *file = setmntent(_PATH_MOUNTED, "r");
+	if (!file) {
+		// In case we're in a chroot or something with /proc but no /etc/mtab
+		file = setmntent("/proc/mounts", "r");
+	}
 	if (!file) {
 		goto fail;
 	}
@@ -93,12 +116,12 @@ struct bfs_mtab *parse_bfs_mtab() {
 
 	struct mntent *mnt;
 	while ((mnt = getmntent(file))) {
-		struct stat sb;
-		if (stat(mnt->mnt_dir, &sb) != 0) {
+		struct bfs_stat sb;
+		if (bfs_stat(AT_FDCWD, mnt->mnt_dir, 0, 0, &sb) != 0) {
 			continue;
 		}
 
-		if (bfs_mtab_push(mtab, sb.st_dev, mnt->mnt_type) != 0) {
+		if (bfs_mtab_push(mtab, sb.dev, mnt->mnt_type) != 0) {
 			goto fail_mtab;
 		}
 	}
@@ -113,7 +136,7 @@ fail_file:
 fail:
 	return NULL;
 
-#elif BSD
+#elif BFS_MNTINFO
 
 	struct statfs *mntbuf;
 	int size = getmntinfo(&mntbuf, MNT_WAIT);
@@ -134,12 +157,12 @@ fail:
 	mtab->capacity = size;
 
 	for (struct statfs *mnt = mntbuf; mnt < mntbuf + size; ++mnt) {
-		struct stat sb;
-		if (stat(mnt->f_mntonname, &sb) != 0) {
+		struct bfs_stat sb;
+		if (bfs_stat(AT_FDCWD, mnt->f_mntonname, 0, 0, &sb) != 0) {
 			continue;
 		}
 
-		if (bfs_mtab_push(mtab, sb.st_dev, mnt->f_fstypename) != 0) {
+		if (bfs_mtab_push(mtab, sb.dev, mnt->f_fstypename) != 0) {
 			goto fail_mtab;
 		}
 	}
@@ -151,6 +174,43 @@ fail_mtab:
 fail:
 	return NULL;
 
+#elif BFS_MNTTAB
+
+	FILE *file = fopen(MNTTAB, "r");
+	if (!file) {
+		goto fail;
+	}
+
+	struct bfs_mtab *mtab = malloc(sizeof(*mtab));
+	if (!mtab) {
+		goto fail_file;
+	}
+	mtab->table = NULL;
+	mtab->size = 0;
+	mtab->capacity = 0;
+
+	struct mnttab mnt;
+	while (getmntent(file, &mnt) == 0) {
+		struct bfs_stat sb;
+		if (bfs_stat(AT_FDCWD, mnt.mnt_mountp, 0, 0, &sb) != 0) {
+			continue;
+		}
+
+		if (bfs_mtab_push(mtab, sb.dev, mnt.mnt_fstype) != 0) {
+			goto fail_mtab;
+		}
+	}
+
+	fclose(file);
+	return mtab;
+
+fail_mtab:
+	free_bfs_mtab(mtab);
+fail_file:
+	fclose(file);
+fail:
+	return NULL;
+
 #else
 
 	errno = ENOTSUP;
@@ -158,9 +218,9 @@ fail:
 #endif
 }
 
-const char *bfs_fstype(const struct bfs_mtab *mtab, const struct stat *statbuf) {
+const char *bfs_fstype(const struct bfs_mtab *mtab, const struct bfs_stat *statbuf) {
 	for (struct bfs_mtab_entry *mnt = mtab->table; mnt < mtab->table + mtab->size; ++mnt) {
-		if (statbuf->st_dev == mnt->dev) {
+		if (statbuf->dev == mnt->dev) {
 			return mnt->type;
 		}
 	}

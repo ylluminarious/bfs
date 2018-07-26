@@ -14,7 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.           *
  ****************************************************************************/
 
-#include "bfs.h"
+#include "cmdline.h"
 #include "util.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -60,7 +60,9 @@ int main(int argc, char *argv[]) {
 		ret = eval_cmdline(cmdline);
 	}
 
-	free_cmdline(cmdline);
+	if (free_cmdline(cmdline) != 0 && ret == EXIT_SUCCESS) {
+		ret = EXIT_FAILURE;
+	}
 
 done:
 	return ret;

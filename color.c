@@ -16,7 +16,9 @@
 
 #include "color.h"
 #include "bftw.h"
+#include "stat.h"
 #include "util.h"
+#include <assert.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -295,24 +297,24 @@ int cfclose(CFILE *cfile) {
 }
 
 static const char *file_color(const struct colors *colors, const char *filename, const struct BFTW *ftwbuf) {
-	const struct stat *sb = ftwbuf->statbuf;
+	const struct bfs_stat *sb = ftwbuf->statbuf;
 	if (!sb) {
 		return colors->orphan;
 	}
 
 	const char *color = NULL;
 
-	switch (sb->st_mode & S_IFMT) {
+	switch (sb->mode & S_IFMT) {
 	case S_IFREG:
-		if (sb->st_mode & S_ISUID) {
+		if (sb->mode & S_ISUID) {
 			color = colors->setuid;
-		} else if (sb->st_mode & S_ISGID) {
+		} else if (sb->mode & S_ISGID) {
 			color = colors->setgid;
-		} else if (sb->st_mode & 0111) {
+		} else if (sb->mode & 0111) {
 			color = colors->exec;
 		}
 
-		if (!color && sb->st_nlink > 1) {
+		if (!color && sb->nlink > 1) {
 			color = colors->multi_hard;
 		}
 
@@ -334,13 +336,13 @@ static const char *file_color(const struct colors *colors, const char *filename,
 		break;
 
 	case S_IFDIR:
-		if (sb->st_mode & S_ISVTX) {
-			if (sb->st_mode & S_IWOTH) {
+		if (sb->mode & S_ISVTX) {
+			if (sb->mode & S_IWOTH) {
 				color = colors->sticky_ow;
 			} else {
 				color = colors->sticky;
 			}
-		} else if (sb->st_mode & S_IWOTH) {
+		} else if (sb->mode & S_IWOTH) {
 			color = colors->ow;
 		}
 
@@ -351,7 +353,7 @@ static const char *file_color(const struct colors *colors, const char *filename,
 		break;
 
 	case S_IFLNK:
-		if (faccessat(ftwbuf->at_fd, ftwbuf->at_path, F_OK, AT_EACCESS) == 0) {
+		if (xfaccessat(ftwbuf->at_fd, ftwbuf->at_path, F_OK) == 0) {
 			color = colors->link;
 		} else {
 			color = colors->orphan;
@@ -454,8 +456,8 @@ static int print_link(CFILE *cfile, const struct BFTW *ftwbuf) {
 	altbuf.path = target;
 	altbuf.nameoff = xbasename(target) - target;
 
-	struct stat statbuf;
-	if (fstatat(ftwbuf->at_fd, ftwbuf->at_path, &statbuf, 0) == 0) {
+	struct bfs_stat statbuf;
+	if (bfs_stat(ftwbuf->at_fd, ftwbuf->at_path, 0, 0, &statbuf) == 0) {
 		altbuf.statbuf = &statbuf;
 	} else {
 		altbuf.statbuf = NULL;
@@ -473,85 +475,117 @@ int cfprintf(CFILE *cfile, const char *format, ...) {
 	FILE *file = cfile->file;
 
 	int ret = -1;
+	int error = errno;
 
 	va_list args;
 	va_start(args, format);
 
 	for (const char *i = format; *i; ++i) {
-		if (*i == '%') {
-			switch (*++i) {
-			case '%':
-				goto one_char;
+		const char *percent = strchr(i, '%');
+		if (!percent) {
+			if (fputs(i, file) == EOF) {
+				goto done;
+			}
+			break;
+		}
 
-			case 'c':
-				if (fputc(va_arg(args, int), file) == EOF) {
-					goto done;
-				}
-				break;
+		size_t len = percent - i;
+		if (fwrite(i, 1, len, file) != len) {
+			goto done;
+		}
 
-			case 'd':
-				if (fprintf(file, "%d", va_arg(args, int)) < 0) {
-					goto done;
-				}
-				break;
+		i = percent + 1;
+		switch (*i) {
+		case '%':
+			if (fputc('%', file) == EOF) {
+				goto done;
+			}
+			break;
 
-			case 's':
-				if (fputs(va_arg(args, const char *), file) == EOF) {
-					goto done;
-				}
-				break;
+		case 'c':
+			if (fputc(va_arg(args, int), file) == EOF) {
+				goto done;
+			}
+			break;
 
-			case 'P':
-				if (print_path(cfile, va_arg(args, const struct BFTW *)) != 0) {
-					goto done;
-				}
-				break;
+		case 'd':
+			if (fprintf(file, "%d", va_arg(args, int)) < 0) {
+				goto done;
+			}
+			break;
 
-			case 'L':
-				if (print_link(cfile, va_arg(args, const struct BFTW *)) != 0) {
-					goto done;
-				}
-				break;
+		case 'g':
+			if (fprintf(file, "%g", va_arg(args, double)) < 0) {
+				goto done;
+			}
+			break;
 
-			case '{': {
-				++i;
-				const char *end = strchr(i, '}');
-				if (!end) {
-					goto invalid;
-				}
-				if (!colors) {
-					i = end;
-					break;
-				}
+		case 's':
+			if (fputs(va_arg(args, const char *), file) == EOF) {
+				goto done;
+			}
+			break;
 
-				size_t len = end - i;
-				char name[len + 1];
-				memcpy(name, i, len);
-				name[len] = '\0';
+		case 'z':
+			++i;
+			if (*i != 'u') {
+				goto invalid;
+			}
+			if (fprintf(file, "%zu", va_arg(args, size_t)) < 0) {
+				goto done;
+			}
+			break;
 
-				const char *esc = get_color(colors, name);
-				if (!esc) {
-					goto invalid;
-				}
-				if (print_esc(esc, file) != 0) {
-					goto done;
-				}
+		case 'm':
+			if (fputs(strerror(error), file) == EOF) {
+				goto done;
+			}
+			break;
 
+		case 'P':
+			if (print_path(cfile, va_arg(args, const struct BFTW *)) != 0) {
+				goto done;
+			}
+			break;
+
+		case 'L':
+			if (print_link(cfile, va_arg(args, const struct BFTW *)) != 0) {
+				goto done;
+			}
+			break;
+
+		case '{': {
+			++i;
+			const char *end = strchr(i, '}');
+			if (!end) {
+				goto invalid;
+			}
+			if (!colors) {
 				i = end;
 				break;
 			}
 
-			default:
-			invalid:
-				errno = EINVAL;
+			size_t len = end - i;
+			char name[len + 1];
+			memcpy(name, i, len);
+			name[len] = '\0';
+
+			const char *esc = get_color(colors, name);
+			if (!esc) {
+				goto invalid;
+			}
+			if (print_esc(esc, file) != 0) {
 				goto done;
 			}
 
-			continue;
+			i = end;
+			break;
 		}
 
-	one_char:
-		if (fputc(*i, file) == EOF) {
+		default:
+		invalid:
+			assert(false);
+			errno = EINVAL;
 			goto done;
 		}
 	}

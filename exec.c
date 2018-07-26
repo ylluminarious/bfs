@@ -15,8 +15,8 @@
  ****************************************************************************/
 
 #include "exec.h"
-#include "bfs.h"
 #include "bftw.h"
+#include "cmdline.h"
 #include "color.h"
 #include "dstring.h"
 #include "util.h"
@@ -77,15 +77,28 @@ static size_t bfs_exec_arg_max(const struct bfs_exec *execbuf) {
 	for (char **envp = environ; *envp; ++envp) {
 		arg_max -= bfs_exec_arg_size(*envp);
 	}
+	// Account for the terminating NULL entry
+	arg_max -= sizeof(char *);
 	bfs_exec_debug(execbuf, "ARG_MAX: %ld remaining after environment variables\n", arg_max);
 
 	// Account for the fixed arguments
 	for (size_t i = 0; i < execbuf->tmpl_argc - 1; ++i) {
 		arg_max -= bfs_exec_arg_size(execbuf->tmpl_argv[i]);
 	}
+	// Account for the terminating NULL entry
+	arg_max -= sizeof(char *);
 	bfs_exec_debug(execbuf, "ARG_MAX: %ld remaining after fixed arguments\n", arg_max);
 
-	// POSIX recommends subtracting 2048, for some wiggle room
+	// Assume arguments are counted with the granularity of a single page,
+	// so allow a one page cushion to account for rounding up
+	long page_size = sysconf(_SC_PAGESIZE);
+	if (page_size < 4096) {
+		page_size = 4096;
+	}
+	arg_max -= page_size;
+	bfs_exec_debug(execbuf, "ARG_MAX: %ld remaining after page cushion\n", arg_max);
+
+	// POSIX recommends an additional 2048 bytes of headroom
 	arg_max -= 2048;
 	bfs_exec_debug(execbuf, "ARG_MAX: %ld remaining after headroom\n", arg_max);
 
@@ -319,38 +332,81 @@ static int bfs_exec_spawn(const struct bfs_exec *execbuf) {
 		}
 	}
 
-	bfs_exec_debug(execbuf, "Executing '%s' ... [%zu arguments]\n", execbuf->argv[0], execbuf->argc - 1);
+	if (execbuf->flags & BFS_EXEC_MULTI) {
+		bfs_exec_debug(execbuf, "Executing '%s' ... [%zu arguments] (size %zu)\n",
+		               execbuf->argv[0], execbuf->argc - 1, execbuf->arg_size);
+	} else {
+		bfs_exec_debug(execbuf, "Executing '%s' ... [%zu arguments]\n", execbuf->argv[0], execbuf->argc - 1);
+	}
+
+	// Use a pipe to report errors from the child
+	int pipefd[2] = {-1, -1};
+	if (pipe_cloexec(pipefd) != 0) {
+		bfs_exec_debug(execbuf, "pipe() failed: %s\n", strerror(errno));
+	}
 
 	pid_t pid = fork();
 
 	if (pid < 0) {
+		close(pipefd[1]);
+		close(pipefd[0]);
 		return -1;
 	} else if (pid > 0) {
-		int status;
-		if (waitpid(pid, &status, 0) < 0) {
+		// Parent
+		close(pipefd[1]);
+
+		int error;
+		ssize_t nbytes = read(pipefd[0], &error, sizeof(error));
+		close(pipefd[0]);
+		if (nbytes == sizeof(error)) {
+			errno = error;
+			return -1;
+		}
+
+		int wstatus;
+		if (waitpid(pid, &wstatus, 0) < 0) {
 			return -1;
 		}
 
 		errno = 0;
-		if (WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS) {
-			return 0;
+
+		if (WIFEXITED(wstatus)) {
+			int status = WEXITSTATUS(wstatus);
+			if (status == EXIT_SUCCESS) {
+				return 0;
+			} else {
+				bfs_exec_debug(execbuf, "Command '%s' failed with status %d\n", execbuf->argv[0], status);
+			}
+		} else if (WIFSIGNALED(wstatus)) {
+			int sig = WTERMSIG(wstatus);
+			bfs_exec_debug(execbuf, "Command '%s' terminated by signal %d\n", execbuf->argv[0], sig);
 		} else {
-			return -1;
+			bfs_exec_debug(execbuf, "Command '%s' terminated abnormally\n", execbuf->argv[0]);
 		}
+
+		return -1;
 	} else {
+		// Child
+		close(pipefd[0]);
+
 		if (execbuf->wd_fd >= 0) {
 			if (fchdir(execbuf->wd_fd) != 0) {
-				perror("fchdir()");
-				goto fail;
+				goto child_err;
 			}
 		}
 
 		execvp(execbuf->argv[0], execbuf->argv);
-		perror("execvp()");
+
+		int error;
+	child_err:
+		error = errno;
+		if (write(pipefd[1], &error, sizeof(error)) != sizeof(error)) {
+			// Parent will still see that we exited unsuccessfully, but won't know why
+		}
+		close(pipefd[1]);
+		_Exit(EXIT_FAILURE);
 	}
 
-fail:
-	_Exit(EXIT_FAILURE);
 }
 
 /** exec() a command for a single file. */
@@ -397,33 +453,63 @@ out:
 	return ret;
 }
 
+/** Check if any arguments remain in the buffer. */
+static bool bfs_exec_args_remain(const struct bfs_exec *execbuf) {
+	return execbuf->argc >= execbuf->tmpl_argc;
+}
+
 /** Execute the pending command from a BFS_EXEC_MULTI execbuf. */
 static int bfs_exec_flush(struct bfs_exec *execbuf) {
-	int ret = 0;
+	int ret = 0, error = 0;
 
-	if (execbuf->argc > execbuf->tmpl_argc - 1) {
+	size_t orig_argc = execbuf->argc;
+	while (bfs_exec_args_remain(execbuf)) {
 		execbuf->argv[execbuf->argc] = NULL;
-		if (bfs_exec_spawn(execbuf) != 0) {
-			ret = -1;
+		ret = bfs_exec_spawn(execbuf);
+		error = errno;
+		if (ret == 0 || error != E2BIG) {
+			break;
 		}
+
+		// Try to recover from E2BIG by trying fewer and fewer arguments
+		// until they fit
+		bfs_exec_debug(execbuf, "Got E2BIG, shrinking argument list...\n");
+		execbuf->argv[execbuf->argc] = execbuf->argv[execbuf->argc - 1];
+		execbuf->arg_size -= bfs_exec_arg_size(execbuf->argv[execbuf->argc]);
+		--execbuf->argc;
 	}
+	size_t new_argc = execbuf->argc;
+	size_t new_size = execbuf->arg_size;
 
-	int error = errno;
-
-	bfs_exec_closewd(execbuf, NULL);
-
-	for (size_t i = execbuf->tmpl_argc - 1; i < execbuf->argc; ++i) {
+	for (size_t i = execbuf->tmpl_argc - 1; i < new_argc; ++i) {
 		free(execbuf->argv[i]);
 	}
 	execbuf->argc = execbuf->tmpl_argc - 1;
 	execbuf->arg_size = 0;
 
+	if (new_argc < orig_argc) {
+		execbuf->arg_max = new_size;
+		bfs_exec_debug(execbuf, "ARG_MAX: %zu\n", execbuf->arg_max);
+
+		// If we recovered from E2BIG, there are unused arguments at the
+		// end of the list
+		for (size_t i = new_argc + 1; i <= orig_argc; ++i) {
+			if (error == 0) {
+				execbuf->argv[execbuf->argc] = execbuf->argv[i];
+				execbuf->arg_size += bfs_exec_arg_size(execbuf->argv[execbuf->argc]);
+				++execbuf->argc;
+			} else {
+				free(execbuf->argv[i]);
+			}
+		}
+	}
+
 	errno = error;
 	return ret;
 }
 
-/** Check if a flush is needed before a new file is processed. */
-static bool bfs_exec_needs_flush(struct bfs_exec *execbuf, const struct BFTW *ftwbuf, const char *arg) {
+/** Check if we need to flush the execbuf because we're changing directories. */
+static bool bfs_exec_changed_dirs(const struct bfs_exec *execbuf, const struct BFTW *ftwbuf) {
 	if (execbuf->flags & BFS_EXEC_CHDIR) {
 		if (ftwbuf->nameoff > execbuf->wd_len
 		    || (execbuf->wd_path && strncmp(ftwbuf->path, execbuf->wd_path, execbuf->wd_len) != 0)) {
@@ -432,8 +518,15 @@ static bool bfs_exec_needs_flush(struct bfs_exec *execbuf, const struct BFTW *ft
 		}
 	}
 
-	if (execbuf->arg_size + bfs_exec_arg_size(arg) > execbuf->arg_max) {
-		bfs_exec_debug(execbuf, "Reached max command size, executing buffered command\n");
+	return false;
+}
+
+/** Check if we need to flush the execbuf because we're too big. */
+static bool bfs_exec_would_overflow(const struct bfs_exec *execbuf, const char *arg) {
+	size_t next_size = execbuf->arg_size + bfs_exec_arg_size(arg);
+	if (next_size > execbuf->arg_max) {
+		bfs_exec_debug(execbuf, "Command size (%zu) would exceed maximum (%zu), executing buffered command\n",
+		               next_size, execbuf->arg_max);
 		return true;
 	}
 
@@ -469,10 +562,13 @@ static int bfs_exec_multi(struct bfs_exec *execbuf, const struct BFTW *ftwbuf) {
 		goto out;
 	}
 
-	if (bfs_exec_needs_flush(execbuf, ftwbuf, arg)) {
-		if (bfs_exec_flush(execbuf) != 0) {
-			ret = -1;
+	if (bfs_exec_changed_dirs(execbuf, ftwbuf)) {
+		while (bfs_exec_args_remain(execbuf)) {
+			ret |= bfs_exec_flush(execbuf);
 		}
+		bfs_exec_closewd(execbuf, ftwbuf);
+	} else if (bfs_exec_would_overflow(execbuf, arg)) {
+		ret |= bfs_exec_flush(execbuf);
 	}
 
 	if ((execbuf->flags & BFS_EXEC_CHDIR) && execbuf->wd_fd < 0) {
@@ -513,8 +609,11 @@ int bfs_exec(struct bfs_exec *execbuf, const struct BFTW *ftwbuf) {
 int bfs_exec_finish(struct bfs_exec *execbuf) {
 	if (execbuf->flags & BFS_EXEC_MULTI) {
 		bfs_exec_debug(execbuf, "Finishing execution, executing buffered command\n");
-		if (bfs_exec_flush(execbuf) != 0) {
-			execbuf->ret = -1;
+		while (bfs_exec_args_remain(execbuf)) {
+			execbuf->ret |= bfs_exec_flush(execbuf);
+		}
+		if (execbuf->ret != 0) {
+			bfs_exec_debug(execbuf, "One or more executions of '%s' failed\n", execbuf->argv[0]);
 		}
 	}
 	return execbuf->ret;

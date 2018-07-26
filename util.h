@@ -23,16 +23,10 @@
 #include <fnmatch.h>
 #include <regex.h>
 #include <stdbool.h>
-#include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 
 // Some portability concerns
-
-#if __APPLE__
-#	define st_atim st_atimespec
-#	define st_ctim st_ctimespec
-#	define st_mtim st_mtimespec
-#endif
 
 #if !defined(FNM_CASEFOLD) && defined(FNM_IGNORECASE)
 #	define FNM_CASEFOLD FNM_IGNORECASE
@@ -102,6 +96,15 @@ int redirect(int fd, const char *path, int flags, ...);
 int dup_cloexec(int fd);
 
 /**
+ * Like pipe(), but set the FD_CLOEXEC flag.
+ *
+ * @param pipefd
+ *         The array to hold the two file descriptors.
+ * @return 0 on success, -1 on failure.
+ */
+int pipe_cloexec(int pipefd[2]);
+
+/**
  * Dynamically allocate a regex error message.
  *
  * @param err
@@ -143,22 +146,17 @@ void format_mode(mode_t mode, char str[11]);
 const char *xbasename(const char *path);
 
 /**
- * stat() a file, falling back on the link itself for broken symbolic links.
- *
- * @param fd
- *         The base directory descriptor.
- * @param path
- *         The path to the file, relative to fd.
- * @param buf
- *         The stat buffer to fill.
- * @param flags
- *         AT_* flags for this call.  Will be updated if a fallback happens.
- * @return 0 on success, -1 on failure.
+ * Wrapper for faccessat() that handles some portability issues.
  */
-int xfstatat(int fd, const char *path, struct stat *buf, int *flags);
+int xfaccessat(int fd, const char *path, int amode);
 
 /**
- * Convert a stat() st_mode to a bftw() typeflag.
+ * Return whether an error code is due to a path not existing.
+ */
+bool is_nonexistence_error(int error);
+
+/**
+ * Convert a bfs_stat() mode to a bftw() typeflag.
  */
 enum bftw_typeflag mode_to_typeflag(mode_t mode);
 

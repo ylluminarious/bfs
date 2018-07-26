@@ -15,9 +15,14 @@
  ****************************************************************************/
 
 #include "bfs.h"
+#include "cmdline.h"
 #include "dstring.h"
+#include "eval.h"
 #include "exec.h"
+#include "expr.h"
+#include "mtab.h"
 #include "printf.h"
+#include "stat.h"
 #include "typo.h"
 #include "util.h"
 #include <ctype.h>
@@ -41,32 +46,34 @@
 // Strings printed by -D tree for "fake" expressions
 static char *fake_and_arg = "-a";
 static char *fake_false_arg = "-false";
-static char *fake_or_arg = "-o";
 static char *fake_print_arg = "-print";
 static char *fake_true_arg = "-true";
 
-/**
- * Singleton true expression instance.
- */
-static struct expr expr_true = {
+// Cost estimation constants
+#define FAST_COST     40.0
+#define STAT_COST   1000.0
+#define PRINT_COST 20000.0
+
+struct expr expr_true = {
 	.eval = eval_true,
 	.lhs = NULL,
 	.rhs = NULL,
 	.pure = true,
 	.always_true = true,
+	.cost = FAST_COST,
+	.probability = 1.0,
 	.argc = 1,
 	.argv = &fake_true_arg,
 };
 
-/**
- * Singleton false expression instance.
- */
-static struct expr expr_false = {
+struct expr expr_false = {
 	.eval = eval_false,
 	.lhs = NULL,
 	.rhs = NULL,
 	.pure = true,
 	.always_false = true,
+	.cost = FAST_COST,
+	.probability = 0.0,
 	.argc = 1,
 	.argv = &fake_false_arg,
 };
@@ -74,33 +81,27 @@ static struct expr expr_false = {
 /**
  * Free an expression.
  */
-static void free_expr(struct expr *expr) {
-	if (expr && expr != &expr_true && expr != &expr_false) {
-		if (expr->cfile && expr->cfile->close) {
-			if (cfclose(expr->cfile) != 0) {
-				perror("cfclose()");
-			}
-		}
-
-		if (expr->regex) {
-			regfree(expr->regex);
-			free(expr->regex);
-		}
-
-		free_bfs_printf(expr->printf);
-		free_bfs_exec(expr->execbuf);
-
-		free_expr(expr->lhs);
-		free_expr(expr->rhs);
-		free(expr);
+void free_expr(struct expr *expr) {
+	if (!expr || expr == &expr_true || expr == &expr_false) {
+		return;
 	}
+
+	if (expr->regex) {
+		regfree(expr->regex);
+		free(expr->regex);
+	}
+
+	free_bfs_printf(expr->printf);
+	free_bfs_exec(expr->execbuf);
+
+	free_expr(expr->lhs);
+	free_expr(expr->rhs);
+
+	free(expr);
 }
 
-/**
- * Create a new expression.
- */
-static struct expr *new_expr(eval_fn *eval, size_t argc, char **argv) {
-	struct expr *expr = malloc(sizeof(struct expr));
+struct expr *new_expr(eval_fn *eval, size_t argc, char **argv) {
+	struct expr *expr = malloc(sizeof(*expr));
 	if (!expr) {
 		perror("malloc()");
 		return NULL;
@@ -112,6 +113,8 @@ static struct expr *new_expr(eval_fn *eval, size_t argc, char **argv) {
 	expr->pure = false;
 	expr->always_true = false;
 	expr->always_false = false;
+	expr->cost = FAST_COST;
+	expr->probability = 0.5;
 	expr->evaluations = 0;
 	expr->successes = 0;
 	expr->elapsed.tv_sec = 0;
@@ -122,6 +125,8 @@ static struct expr *new_expr(eval_fn *eval, size_t argc, char **argv) {
 	expr->regex = NULL;
 	expr->execbuf = NULL;
 	expr->printf = NULL;
+	expr->persistent_fds = 0;
+	expr->ephemeral_fds = 0;
 	return expr;
 }
 
@@ -136,6 +141,8 @@ static struct expr *new_unary_expr(eval_fn *eval, struct expr *rhs, char **argv)
 	}
 
 	expr->rhs = rhs;
+	expr->persistent_fds = rhs->persistent_fds;
+	expr->ephemeral_fds = rhs->ephemeral_fds;
 	return expr;
 }
 
@@ -152,6 +159,12 @@ static struct expr *new_binary_expr(eval_fn *eval, struct expr *lhs, struct expr
 
 	expr->lhs = lhs;
 	expr->rhs = rhs;
+	expr->persistent_fds = lhs->persistent_fds + rhs->persistent_fds;
+	if (lhs->ephemeral_fds > rhs->ephemeral_fds) {
+		expr->ephemeral_fds = lhs->ephemeral_fds;
+	} else {
+		expr->ephemeral_fds = rhs->ephemeral_fds;
+	}
 	return expr;
 }
 
@@ -164,6 +177,14 @@ bool expr_never_returns(const struct expr *expr) {
 }
 
 /**
+ * Set an expression to always return true.
+ */
+static void expr_set_always_true(struct expr *expr) {
+	expr->always_true = true;
+	expr->probability = 1.0;
+}
+
+/**
  * Set an expression to never return.
  */
 static void expr_set_never_returns(struct expr *expr) {
@@ -173,7 +194,7 @@ static void expr_set_never_returns(struct expr *expr) {
 /**
  * Dump the parsed expression tree, for debugging.
  */
-static void dump_expr(CFILE *cfile, const struct expr *expr, bool verbose) {
+void dump_expr(CFILE *cfile, const struct expr *expr, bool verbose) {
 	fputs("(", cfile->file);
 
 	if (expr->lhs || expr->rhs) {
@@ -192,7 +213,7 @@ static void dump_expr(CFILE *cfile, const struct expr *expr, bool verbose) {
 			rate = 100.0*expr->successes/expr->evaluations;
 			time = (1.0e9*expr->elapsed.tv_sec + expr->elapsed.tv_nsec)/expr->evaluations;
 		}
-		fprintf(cfile->file, " [%zu/%zu=%g%%; %gns]", expr->successes, expr->evaluations, rate, time);
+		cfprintf(cfile, " [%{ylw}%zu%{rs}/%{ylw}%zu%{rs}=%{ylw}%g%%%{rs}; %{ylw}%gns%{rs}]", expr->successes, expr->evaluations, rate, time);
 	}
 
 	if (expr->lhs) {
@@ -209,16 +230,60 @@ static void dump_expr(CFILE *cfile, const struct expr *expr, bool verbose) {
 }
 
 /**
+ * An open file for the command line.
+ */
+struct open_file {
+	/** The file itself. */
+	CFILE *cfile;
+	/** The path to the file (for diagnostics). */
+	const char *path;
+	/** Device number (for deduplication). */
+	dev_t dev;
+	/** Inode number (for deduplication). */
+	ino_t ino;
+	/** The next open file in the chain. */
+	struct open_file *next;
+};
+
+/**
  * Free the parsed command line.
  */
-void free_cmdline(struct cmdline *cmdline) {
+int free_cmdline(struct cmdline *cmdline) {
+	int ret = 0;
+
 	if (cmdline) {
+		CFILE *cout = cmdline->cout;
+		CFILE *cerr = cmdline->cerr;
+
 		free_expr(cmdline->expr);
 
 		free_bfs_mtab(cmdline->mtab);
 
-		cfclose(cmdline->cerr);
-		cfclose(cmdline->cout);
+		struct open_file *ofile = cmdline->open_files;
+		while (ofile) {
+			struct open_file *next = ofile->next;
+
+			if (cfclose(ofile->cfile) != 0) {
+				if (cerr) {
+					cfprintf(cerr, "%{er}error: '%s': %m%{rs}\n", ofile->path);
+				}
+				ret = -1;
+			}
+
+			free(ofile);
+			ofile = next;
+		}
+
+		if (cout && fflush(cout->file) != 0) {
+			if (cerr) {
+				cfprintf(cerr, "%{er}error: standard output: %m%{rs}\n");
+			}
+			ret = -1;
+		}
+
+		cfclose(cout);
+		cfclose(cerr);
+
 		free_colors(cmdline->colors);
 
 		struct root *root = cmdline->roots;
@@ -231,6 +296,8 @@ void free_cmdline(struct cmdline *cmdline) {
 		free(cmdline->argv);
 		free(cmdline);
 	}
+
+	return ret;
 }
 
 /**
@@ -301,53 +368,79 @@ enum token_type {
 };
 
 /**
- * Log an optimization.
+ * Fill in a "-print"-type expression.
  */
-static void debug_opt(const struct parser_state *state, const char *format, ...) {
-	if (!(state->cmdline->debug & DEBUG_OPT)) {
-		return;
-	}
-
-	CFILE *cerr = state->cmdline->cerr;
-
-	va_list args;
-	va_start(args, format);
-
-	for (const char *i = format; *i != '\0'; ++i) {
-		if (*i == '%') {
-			switch (*++i) {
-			case '%':
-				fputc('%', stderr);
-				break;
-
-			case 'e':
-				dump_expr(cerr, va_arg(args, const struct expr *), false);
-				break;
-
-			case 's':
-				cfprintf(cerr, "%{red}%s%{rs}", va_arg(args, const char *));
-				break;
-			}
-		} else {
-			fputc(*i, stderr);
-		}
-	}
-
-	va_end(args);
+static void init_print_expr(struct parser_state *state, struct expr *expr) {
+	expr_set_always_true(expr);
+	expr->cost = PRINT_COST;
+	expr->cfile = state->cmdline->cout;
 }
 
 /**
- * Invoke stat() on an argument.
+ * Open a file for an expression.
  */
-static int stat_arg(const struct parser_state *state, struct expr *expr, struct stat *sb) {
+static int expr_open(struct parser_state *state, struct expr *expr, const char *path) {
+	int ret = -1;
+
+	struct cmdline *cmdline = state->cmdline;
+
+	CFILE *cfile = cfopen(path, state->use_color ? cmdline->colors : NULL);
+	if (!cfile) {
+		cfprintf(cmdline->cerr, "%{er}error: '%s': %m%{rs}\n", path);
+		goto out;
+	}
+
+	struct bfs_stat sb;
+	if (bfs_fstat(fileno(cfile->file), &sb) != 0) {
+		cfprintf(cmdline->cerr, "%{er}error: '%s': %m%{rs}\n", path);
+		goto out_close;
+	}
+
+	for (struct open_file *ofile = cmdline->open_files; ofile; ofile = ofile->next) {
+		if (ofile->dev == sb.dev && ofile->ino == sb.ino) {
+			expr->cfile = ofile->cfile;
+			ret = 0;
+			goto out_close;
+		}
+	}
+
+	struct open_file *ofile = malloc(sizeof(*ofile));
+	if (!ofile) {
+		perror("malloc()");
+		goto out_close;
+	}
+
+	ofile->cfile = cfile;
+	ofile->path = path;
+	ofile->dev = sb.dev;
+	ofile->ino = sb.ino;
+	ofile->next = cmdline->open_files;
+	cmdline->open_files = ofile;
+	++cmdline->nopen_files;
+
+	expr->cfile = cfile;
+
+	ret = 0;
+	goto out;
+
+out_close:
+	cfclose(cfile);
+out:
+	return ret;
+}
+
+/**
+ * Invoke bfs_stat() on an argument.
+ */
+static int stat_arg(const struct parser_state *state, struct expr *expr, struct bfs_stat *sb) {
 	const struct cmdline *cmdline = state->cmdline;
 
 	bool follow = cmdline->flags & (BFTW_COMFOLLOW | BFTW_LOGICAL);
-	int flags = follow ? 0 : AT_SYMLINK_NOFOLLOW;
+	int at_flags = follow ? 0 : AT_SYMLINK_NOFOLLOW;
 
-	int ret = xfstatat(AT_FDCWD, expr->sdata, sb, &flags);
+	int ret = bfs_stat(AT_FDCWD, expr->sdata, at_flags, BFS_STAT_BROKEN_OK, sb);
 	if (ret != 0) {
-		cfprintf(cmdline->cerr, "%{er}error: '%s': %s%{rs}\n", expr->sdata, strerror(errno));
+		cfprintf(cmdline->cerr, "%{er}error: '%s': %m%{rs}\n", expr->sdata);
 	}
 	return ret;
 }
@@ -728,19 +821,26 @@ static struct expr *parse_debug(struct parser_state *state, int arg1, int arg2) 
 		printf("Supported debug flags:\n\n");
 
 		printf("  help:   This message.\n");
+		printf("  cost:   Show cost estimates.\n");
+		printf("  exec:   Print executed command details.\n");
 		printf("  opt:    Print optimization details.\n");
 		printf("  rates:  Print predicate success rates.\n");
+		printf("  search: Trace the filesystem traversal.\n");
 		printf("  stat:   Trace all stat() calls.\n");
 		printf("  tree:   Print the parse tree.\n");
 
 		state->just_info = true;
 		return NULL;
+	} else if (strcmp(flag, "cost") == 0) {
+		cmdline->debug |= DEBUG_COST;
 	} else if (strcmp(flag, "exec") == 0) {
 		cmdline->debug |= DEBUG_EXEC;
 	} else if (strcmp(flag, "opt") == 0) {
 		cmdline->debug |= DEBUG_OPT;
 	} else if (strcmp(flag, "rates") == 0) {
 		cmdline->debug |= DEBUG_RATES;
+	} else if (strcmp(flag, "search") == 0) {
+		cmdline->debug |= DEBUG_SEARCH;
 	} else if (strcmp(flag, "stat") == 0) {
 		cmdline->debug |= DEBUG_STAT;
 	} else if (strcmp(flag, "tree") == 0) {
@@ -805,36 +905,42 @@ static struct expr *parse_access(struct parser_state *state, int flag, int arg2)
 }
 
 /**
- * Parse -[acm]{min,time}.
+ * Parse -[aBcm]?newer.
  */
-static struct expr *parse_acmtime(struct parser_state *state, int field, int unit) {
-	struct expr *expr = parse_test_icmp(state, eval_acmtime);
-	if (expr) {
-		expr->reftime = state->now;
-		expr->time_field = field;
-		expr->time_unit = unit;
-	}
-	return expr;
-}
-
-/**
- * Parse -[ac]?newer.
- */
-static struct expr *parse_acnewer(struct parser_state *state, int field, int arg2) {
-	struct expr *expr = parse_unary_test(state, eval_acnewer);
+static struct expr *parse_newer(struct parser_state *state, int field, int arg2) {
+	struct expr *expr = parse_unary_test(state, eval_newer);
 	if (!expr) {
 		return NULL;
 	}
 
-	struct stat sb;
+	struct bfs_stat sb;
 	if (stat_arg(state, expr, &sb) != 0) {
-		free_expr(expr);
+		goto fail;
+	}
+
+	expr->cost = STAT_COST;
+	expr->reftime = sb.mtime;
+	expr->stat_field = field;
+	return expr;
+
+fail:
+	free_expr(expr);
+	return NULL;
+}
+
+/**
+ * Parse -[aBcm]{min,time}.
+ */
+static struct expr *parse_time(struct parser_state *state, int field, int unit) {
+	struct expr *expr = parse_test_icmp(state, eval_time);
+	if (!expr) {
 		return NULL;
 	}
 
-	expr->reftime = sb.st_mtim;
-	expr->time_field = field;
-
+	expr->cost = STAT_COST;
+	expr->reftime = state->now;
+	expr->stat_field = field;
+	expr->time_unit = unit;
 	return expr;
 }
 
@@ -947,7 +1053,24 @@ static struct expr *parse_depth_limit(struct parser_state *state, int is_min, in
  * Parse -empty.
  */
 static struct expr *parse_empty(struct parser_state *state, int arg1, int arg2) {
-	return parse_nullary_test(state, eval_empty);
+	struct expr *expr = parse_nullary_test(state, eval_empty);
+	if (!expr) {
+		return NULL;
+	}
+
+	expr->cost = 2000.0;
+	expr->probability = 0.01;
+
+	if (state->cmdline->optlevel < 4) {
+		// Since -empty attempts to open and read directories, it may
+		// have side effects such as reporting permission errors, and
+		// thus shouldn't be re-ordered without aggressive optimizations
+		expr->pure = false;
+	}
+
+	expr->ephemeral_fds = 1;
+
+	return expr;
 }
 
 /**
@@ -959,21 +1082,28 @@ static struct expr *parse_exec(struct parser_state *state, int flags, int arg2) 
 		return NULL;
 	}
 
-	if ((execbuf->flags & BFS_EXEC_CHDIR) && (execbuf->flags & BFS_EXEC_MULTI)) {
-		++state->cmdline->nopen_files;
-	}
-
 	struct expr *expr = parse_action(state, eval_exec, execbuf->tmpl_argc + 2);
 	if (!expr) {
 		free_bfs_exec(execbuf);
 		return NULL;
 	}
 
+	expr->execbuf = execbuf;
+
 	if (execbuf->flags & BFS_EXEC_MULTI) {
-		expr->always_true = true;
+		expr_set_always_true(expr);
+	} else {
+		expr->cost = 1000000.0;
 	}
 
-	expr->execbuf = execbuf;
+	expr->ephemeral_fds = 2;
+	if (execbuf->flags & BFS_EXEC_CHDIR) {
+		if (execbuf->flags & BFS_EXEC_MULTI) {
+			expr->persistent_fds = 1;
+		} else {
+			++expr->ephemeral_fds;
+		}
+	}
 
 	return expr;
 }
@@ -1019,26 +1149,13 @@ static struct expr *parse_f(struct parser_state *state, int arg1, int arg2) {
 }
 
 /**
- * Open a file for an expression.
- */
-static int expr_open(struct parser_state *state, struct expr *expr, const char *path) {
-	expr->cfile = cfopen(path, state->use_color ? state->cmdline->colors : NULL);
-	if (!expr->cfile) {
-		cfprintf(state->cmdline->cerr, "%{er}error: '%s': %s%{rs}\n", path, strerror(errno));
-		return -1;
-	}
-
-	++state->cmdline->nopen_files;
-	return 0;
-}
-
-/**
  * Parse -fls FILE.
  */
 static struct expr *parse_fls(struct parser_state *state, int arg1, int arg2) {
 	struct expr *expr = parse_unary_action(state, eval_fls);
 	if (expr) {
-		expr->always_true = true;
+		expr_set_always_true(expr);
+		expr->cost = PRINT_COST;
 		if (expr_open(state, expr, expr->sdata) != 0) {
 			goto fail;
 		}
@@ -1057,7 +1174,8 @@ fail:
 static struct expr *parse_fprint(struct parser_state *state, int arg1, int arg2) {
 	struct expr *expr = parse_unary_action(state, eval_fprint);
 	if (expr) {
-		expr->always_true = true;
+		expr_set_always_true(expr);
+		expr->cost = PRINT_COST;
 		if (expr_open(state, expr, expr->sdata) != 0) {
 			goto fail;
 		}
@@ -1075,7 +1193,8 @@ fail:
 static struct expr *parse_fprint0(struct parser_state *state, int arg1, int arg2) {
 	struct expr *expr = parse_unary_action(state, eval_fprint0);
 	if (expr) {
-		expr->always_true = true;
+		expr_set_always_true(expr);
+		expr->cost = PRINT_COST;
 		if (expr_open(state, expr, expr->sdata) != 0) {
 			goto fail;
 		}
@@ -1110,7 +1229,9 @@ static struct expr *parse_fprintf(struct parser_state *state, int arg1, int arg2
 		return NULL;
 	}
 
-	expr->always_true = true;
+	expr_set_always_true(expr);
+
+	expr->cost = PRINT_COST;
 
 	if (expr_open(state, expr, file) != 0) {
 		goto fail;
@@ -1136,12 +1257,16 @@ static struct expr *parse_fstype(struct parser_state *state, int arg1, int arg2)
 	if (!cmdline->mtab) {
 		cmdline->mtab = parse_bfs_mtab();
 		if (!cmdline->mtab) {
-			cfprintf(cmdline->cerr, "%{er}error: Couldn't parse the mount table: %s.%{rs}\n\n", strerror(errno));
+			cfprintf(cmdline->cerr, "%{er}error: Couldn't parse the mount table: %m%{rs}\n");
 			return NULL;
 		}
 	}
 
-	return parse_unary_test(state, eval_fstype);
+	struct expr *expr = parse_unary_test(state, eval_fstype);
+	if (expr) {
+		expr->cost = STAT_COST;
+	}
+	return expr;
 }
 
 /**
@@ -1168,6 +1293,8 @@ static struct expr *parse_group(struct parser_state *state, int arg1, int arg2) 
 		goto fail;
 	}
 
+	expr->cost = STAT_COST;
+
 	return expr;
 
 fail:
@@ -1179,7 +1306,11 @@ fail:
  * Parse -used N.
  */
 static struct expr *parse_used(struct parser_state *state, int arg1, int arg2) {
-	return parse_test_icmp(state, eval_used);
+	struct expr *expr = parse_test_icmp(state, eval_used);
+	if (expr) {
+		expr->cost = STAT_COST;
+	}
+	return expr;
 }
 
 /**
@@ -1206,6 +1337,8 @@ static struct expr *parse_user(struct parser_state *state, int arg1, int arg2) {
 		goto fail;
 	}
 
+	expr->cost = STAT_COST;
+
 	return expr;
 
 fail:
@@ -1217,7 +1350,11 @@ fail:
  * Parse -hidden.
  */
 static struct expr *parse_hidden(struct parser_state *state, int arg1, int arg2) {
-	return parse_nullary_test(state, eval_hidden);
+	struct expr *expr = parse_nullary_test(state, eval_hidden);
+	if (expr) {
+		expr->probability = 0.01;
+	}
+	return expr;
 }
 
 /**
@@ -1232,14 +1369,24 @@ static struct expr *parse_ignore_races(struct parser_state *state, int ignore, i
  * Parse -inum N.
  */
 static struct expr *parse_inum(struct parser_state *state, int arg1, int arg2) {
-	return parse_test_icmp(state, eval_inum);
+	struct expr *expr = parse_test_icmp(state, eval_inum);
+	if (expr) {
+		expr->cost = STAT_COST;
+		expr->probability = expr->cmp_flag == CMP_EXACT ? 0.01 : 0.50;
+	}
+	return expr;
 }
 
 /**
  * Parse -links N.
  */
 static struct expr *parse_links(struct parser_state *state, int arg1, int arg2) {
-	return parse_test_icmp(state, eval_links);
+	struct expr *expr = parse_test_icmp(state, eval_links);
+	if (expr) {
+		expr->cost = STAT_COST;
+		expr->probability = expr_cmp(expr, 1) ? 0.99 : 0.01;
+	}
+	return expr;
 }
 
 /**
@@ -1248,8 +1395,7 @@ static struct expr *parse_links(struct parser_state *state, int arg1, int arg2) 
 static struct expr *parse_ls(struct parser_state *state, int arg1, int arg2) {
 	struct expr *expr = parse_nullary_action(state, eval_fls);
 	if (expr) {
-		expr->always_true = true;
-		expr->cfile = state->cmdline->cout;
+		init_print_expr(state, expr);
 		expr->reftime = state->now;
 	}
 	return expr;
@@ -1264,22 +1410,33 @@ static struct expr *parse_mount(struct parser_state *state, int arg1, int arg2) 
 }
 
 /**
- * Set the FNM_CASEFOLD flag, if supported.
+ * Common code for fnmatch() tests.
  */
-static struct expr *set_fnm_casefold(const struct parser_state *state, struct expr *expr, bool casefold) {
-	if (expr) {
-		if (casefold) {
-#ifdef FNM_CASEFOLD
-			expr->idata = FNM_CASEFOLD;
-#else
-			cfprintf(state->cmdline->cerr, "%{er}error: %s is missing platform support.%{rs}\n", expr->argv[0]);
-			free_expr(expr);
-			return NULL;
-#endif
-		} else {
-			expr->idata = 0;
-		}
+static struct expr *parse_fnmatch(const struct parser_state *state, struct expr *expr, bool casefold) {
+	if (!expr) {
+		return NULL;
 	}
+
+	if (casefold) {
+#ifdef FNM_CASEFOLD
+		expr->idata = FNM_CASEFOLD;
+#else
+		cfprintf(state->cmdline->cerr, "%{er}error: %s is missing platform support.%{rs}\n", expr->argv[0]);
+		free_expr(expr);
+		return NULL;
+#endif
+	} else {
+		expr->idata = 0;
+	}
+
+	expr->cost = 400.0;
+
+	if (strchr(expr->sdata, '*')) {
+		expr->probability = 0.5;
+	} else {
+		expr->probability = 0.1;
+	}
+
 	return expr;
 }
 
@@ -1288,7 +1445,7 @@ static struct expr *set_fnm_casefold(const struct parser_state *state, struct ex
  */
 static struct expr *parse_name(struct parser_state *state, int casefold, int arg2) {
 	struct expr *expr = parse_unary_test(state, eval_name);
-	return set_fnm_casefold(state, expr, casefold);
+	return parse_fnmatch(state, expr, casefold);
 }
 
 /**
@@ -1296,7 +1453,7 @@ static struct expr *parse_name(struct parser_state *state, int casefold, int arg
  */
 static struct expr *parse_path(struct parser_state *state, int casefold, int arg2) {
 	struct expr *expr = parse_unary_test(state, eval_path);
-	return set_fnm_casefold(state, expr, casefold);
+	return parse_fnmatch(state, expr, casefold);
 }
 
 /**
@@ -1304,71 +1461,76 @@ static struct expr *parse_path(struct parser_state *state, int casefold, int arg
  */
 static struct expr *parse_lname(struct parser_state *state, int casefold, int arg2) {
 	struct expr *expr = parse_unary_test(state, eval_lname);
-	return set_fnm_casefold(state, expr, casefold);
+	return parse_fnmatch(state, expr, casefold);
 }
 
 /**
  * Parse -newerXY.
  */
 static struct expr *parse_newerxy(struct parser_state *state, int arg1, int arg2) {
+	CFILE *cerr = state->cmdline->cerr;
+
 	const char *arg = state->argv[0];
 	if (strlen(arg) != 8) {
-		cfprintf(state->cmdline->cerr, "%{er}error: Expected -newerXY; found %s.%{rs}\n", arg);
+		cfprintf(cerr, "%{er}error: Expected -newerXY; found %s.%{rs}\n", arg);
 		return NULL;
 	}
 
-	struct expr *expr = parse_unary_test(state, eval_acnewer);
+	struct expr *expr = parse_unary_test(state, eval_newer);
 	if (!expr) {
 		goto fail;
 	}
 
 	switch (arg[6]) {
 	case 'a':
-		expr->time_field = ATIME;
+		expr->stat_field = BFS_STAT_ATIME;
 		break;
 	case 'c':
-		expr->time_field = CTIME;
+		expr->stat_field = BFS_STAT_CTIME;
 		break;
 	case 'm':
-		expr->time_field = MTIME;
+		expr->stat_field = BFS_STAT_MTIME;
+		break;
+	case 'B':
+		expr->stat_field = BFS_STAT_BTIME;
 		break;
 
-	case 'B':
-		cfprintf(state->cmdline->cerr, "%{er}error: %s: File birth times ('B') are not supported.%{rs}\n", arg);
-		goto fail;
-
 	default:
-		cfprintf(state->cmdline->cerr, "%{er}error: %s: For -newerXY, X should be 'a', 'c', 'm', or 'B'.%{rs}\n", arg);
+		cfprintf(cerr, "%{er}error: %s: For -newerXY, X should be 'a', 'c', 'm', or 'B'.%{rs}\n", arg);
 		goto fail;
 	}
 
 	if (arg[7] == 't') {
-		cfprintf(state->cmdline->cerr, "%{er}error: %s: Explicit reference times ('t') are not supported.%{rs}\n", arg);
+		cfprintf(cerr, "%{er}error: %s: Explicit reference times ('t') are not supported.%{rs}\n", arg);
 		goto fail;
 	} else {
-		struct stat sb;
+		struct bfs_stat sb;
 		if (stat_arg(state, expr, &sb) != 0) {
 			goto fail;
 		}
 
 		switch (arg[7]) {
 		case 'a':
-			expr->reftime = sb.st_atim;
+			expr->reftime = sb.atime;
 			break;
 		case 'c':
-			expr->reftime = sb.st_ctim;
+			expr->reftime = sb.ctime;
 			break;
 		case 'm':
-			expr->reftime = sb.st_mtim;
+			expr->reftime = sb.mtime;
 			break;
 
 		case 'B':
-			cfprintf(state->cmdline->cerr, "%{er}error: %s: File birth times ('B') are not supported.%{rs}\n", arg);
-			goto fail;
+			if (sb.mask & BFS_STAT_BTIME) {
+				expr->reftime = sb.btime;
+			} else {
+				cfprintf(cerr, "%{er}error: '%s': Couldn't get file birth time.%{rs}\n", expr->sdata);
+				goto fail;
+			}
+			break;
 
 		default:
-			cfprintf(state->cmdline->cerr,
-			         "%{er}error: %s: For -newerXY, Y should be 'a', 'c', 'm', 'B', or 't'.%{rs}\n", arg);
+			cfprintf(cerr, "%{er}error: %s: For -newerXY, Y should be 'a', 'c', 'm', 'B', or 't'.%{rs}\n", arg);
 			goto fail;
 		}
 	}
@@ -1384,7 +1546,11 @@ fail:
  * Parse -nogroup.
  */
 static struct expr *parse_nogroup(struct parser_state *state, int arg1, int arg2) {
-	return parse_nullary_test(state, eval_nogroup);
+	struct expr *expr = parse_nullary_test(state, eval_nogroup);
+	if (expr) {
+		expr->cost = 9000.0;
+	}
+	return expr;
 }
 
 /**
@@ -1412,7 +1578,11 @@ static struct expr *parse_noleaf(struct parser_state *state, int arg1, int arg2)
  * Parse -nouser.
  */
 static struct expr *parse_nouser(struct parser_state *state, int arg1, int arg2) {
-	return parse_nullary_test(state, eval_nouser);
+	struct expr *expr = parse_nullary_test(state, eval_nouser);
+	if (expr) {
+		expr->cost = 9000.0;
+	}
+	return expr;
 }
 
 /**
@@ -1653,6 +1823,12 @@ static struct expr *parse_perm(struct parser_state *state, int field, int arg2) 
 		expr->mode_cmp = MODE_ANY;
 		++mode;
 		break;
+	case '+':
+		if (mode[1] >= '0' && mode[1] <= '9') {
+			expr->mode_cmp = MODE_ANY;
+			++mode;
+			break;
+		}
 	default:
 		expr->mode_cmp = MODE_EXACT;
 		break;
@@ -1661,6 +1837,8 @@ static struct expr *parse_perm(struct parser_state *state, int field, int arg2) 
 	if (parse_mode(state, mode, expr) != 0) {
 		goto fail;
 	}
+
+	expr->cost = STAT_COST;
 
 	return expr;
 
@@ -1674,12 +1852,9 @@ fail:
  */
 static struct expr *parse_print(struct parser_state *state, int arg1, int arg2) {
 	struct expr *expr = parse_nullary_action(state, eval_fprint);
-	if (!expr) {
-		return NULL;
+	if (expr) {
+		init_print_expr(state, expr);
 	}
-
-	expr->always_true = true;
-	expr->cfile = state->cmdline->cout;
 	return expr;
 }
 
@@ -1689,8 +1864,7 @@ static struct expr *parse_print(struct parser_state *state, int arg1, int arg2) 
 static struct expr *parse_print0(struct parser_state *state, int arg1, int arg2) {
 	struct expr *expr = parse_nullary_action(state, eval_fprint0);
 	if (expr) {
-		expr->always_true = true;
-		expr->cfile = state->cmdline->cout;
+		init_print_expr(state, expr);
 	}
 	return expr;
 }
@@ -1704,9 +1878,7 @@ static struct expr *parse_printf(struct parser_state *state, int arg1, int arg2)
 		return NULL;
 	}
 
-	expr->always_true = true;
-
-	expr->cfile = state->cmdline->cout;
+	init_print_expr(state, expr);
 
 	expr->printf = parse_bfs_printf(expr->sdata, state->cmdline);
 	if (!expr->printf) {
@@ -1723,8 +1895,7 @@ static struct expr *parse_printf(struct parser_state *state, int arg1, int arg2)
 static struct expr *parse_printx(struct parser_state *state, int arg1, int arg2) {
 	struct expr *expr = parse_nullary_action(state, eval_fprintx);
 	if (expr) {
-		expr->always_true = true;
-		expr->cfile = state->cmdline->cout;
+		init_print_expr(state, expr);
 	}
 	return expr;
 }
@@ -1737,7 +1908,7 @@ static struct expr *parse_prune(struct parser_state *state, int arg1, int arg2) 
 
 	struct expr *expr = parse_nullary_action(state, eval_prune);
 	if (expr) {
-		expr->always_true = true;
+		expr_set_always_true(expr);
 	}
 	return expr;
 }
@@ -1844,20 +2015,23 @@ static struct expr *parse_samefile(struct parser_state *state, int arg1, int arg
 		return NULL;
 	}
 
-	struct stat sb;
+	struct bfs_stat sb;
 	if (stat_arg(state, expr, &sb) != 0) {
 		free_expr(expr);
 		return NULL;
 	}
 
-	expr->dev = sb.st_dev;
-	expr->ino = sb.st_ino;
+	expr->dev = sb.dev;
+	expr->ino = sb.ino;
+
+	expr->cost = STAT_COST;
+	expr->probability = 0.01;
 
 	return expr;
 }
 
 /**
- * Parse -size N[bcwkMG]?.
+ * Parse -size N[cwbkMGTP]?.
  */
 static struct expr *parse_size(struct parser_state *state, int arg1, int arg2) {
 	struct expr *expr = parse_unary_test(state, eval_size);
@@ -1905,11 +2079,14 @@ static struct expr *parse_size(struct parser_state *state, int arg1, int arg2) {
 		goto bad_unit;
 	}
 
+	expr->cost = STAT_COST;
+	expr->probability = expr->cmp_flag == CMP_EXACT ? 0.01 : 0.50;
+
 	return expr;
 
 bad_unit:
 	cfprintf(state->cmdline->cerr,
-	         "%{er}error: %s %s: Expected a size unit (one of bcwkMGTP); found %s.%{rs}\n",
+	         "%{er}error: %s %s: Expected a size unit (one of cwbkMGTP); found %s.%{rs}\n",
 	         expr->argv[0], expr->argv[1], unit);
 fail:
 	free_expr(expr);
@@ -1920,7 +2097,11 @@ fail:
  * Parse -sparse.
  */
 static struct expr *parse_sparse(struct parser_state *state, int arg1, int arg2) {
-	return parse_nullary_test(state, eval_sparse);
+	struct expr *expr = parse_nullary_test(state, eval_sparse);
+	if (expr) {
+		expr->cost = STAT_COST;
+	}
+	return expr;
 }
 
 /**
@@ -1934,33 +2115,42 @@ static struct expr *parse_type(struct parser_state *state, int x, int arg2) {
 	}
 
 	enum bftw_typeflag types = 0;
+	double probability = 0.0;
 
 	const char *c = expr->sdata;
 	while (true) {
 		switch (*c) {
 		case 'b':
 			types |= BFTW_BLK;
+			probability += 0.00000721183;
 			break;
 		case 'c':
 			types |= BFTW_CHR;
+			probability += 0.0000499855;
 			break;
 		case 'd':
 			types |= BFTW_DIR;
+			probability += 0.114475;
 			break;
 		case 'D':
 			types |= BFTW_DOOR;
+			probability += 0.000001;
 			break;
 		case 'p':
 			types |= BFTW_FIFO;
+			probability += 0.00000248684;
 			break;
 		case 'f':
 			types |= BFTW_REG;
+			probability += 0.859772;
 			break;
 		case 'l':
 			types |= BFTW_LNK;
+			probability += 0.0256816;
 			break;
 		case 's':
 			types |= BFTW_SOCK;
+			probability += 0.0000116881;
 			break;
 
 		case '\0':
@@ -1991,6 +2181,15 @@ static struct expr *parse_type(struct parser_state *state, int x, int arg2) {
 	}
 
 	expr->idata = types;
+	expr->probability = probability;
+
+	if (x && state->cmdline->optlevel < 4) {
+		// Since -xtype dereferences symbolic links, it may have side
+		// effects such as reporting permission errors, and thus
+		// shouldn't be re-ordered without aggressive optimizations
+		expr->pure = false;
+	}
+
 	return expr;
 
 fail:
@@ -2083,7 +2282,8 @@ static struct expr *parse_help(struct parser_state *state, int arg1, int arg2) {
 	cfprintf(cout, "  %{cyn}-D%{rs} %{bld}FLAG%{rs}\n");
 	cfprintf(cout, "      Turn on a debugging flag (see %{cyn}-D%{rs} %{bld}help%{rs})\n");
 	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}N%{rs}\n");
-	cfprintf(cout, "      Enable optimization level %{bld}N%{rs} (default: 3)\n\n");
+	cfprintf(cout, "      Enable optimization level %{bld}N%{rs} (default: 3; interpreted differently than GNU\n");
+	cfprintf(cout, "      find -- see below)\n\n");
 
 	cfprintf(cout, "  %{blu}-d%{rs}\n");
 	cfprintf(cout, "      Search in post-order (same as %{blu}-depth%{rs})\n");
@@ -2101,9 +2301,10 @@ static struct expr *parse_help(struct parser_state *state, int arg1, int arg2) {
 	cfprintf(cout, "  %{blu}-mount%{rs}\n");
 	cfprintf(cout, "      Don't descend into other mount points (same as %{blu}-xdev%{rs})\n");
 	cfprintf(cout, "  %{blu}-noleaf%{rs}\n");
-	cfprintf(cout, "      Ignored, for compatibility with GNU find\n");
+	cfprintf(cout, "      Ignored; for compatibility with GNU find\n");
 	cfprintf(cout, "  %{blu}-regextype%{rs} %{bld}TYPE%{rs}\n");
-	cfprintf(cout, "      Use TYPE-flavored regexes (see -regextype help)\n");
+	cfprintf(cout, "      Use %{bld}TYPE%{rs}-flavored regexes (default: %{bld}posix-basic%{rs}; see %{blu}-regextype%{rs}"
+	                " %{bld}help%{rs})\n");
 	cfprintf(cout, "  %{blu}-warn%{rs}\n");
 	cfprintf(cout, "  %{blu}-nowarn%{rs}\n");
 	cfprintf(cout, "      Turn on or off warnings about the command line\n\n");
@@ -2136,15 +2337,17 @@ static struct expr *parse_help(struct parser_state *state, int arg1, int arg2) {
 	cfprintf(cout, "      Find symbolic links whose target matches the %{bld}GLOB%{rs}\n");
 	cfprintf(cout, "  %{blu}-newer%{rs}%{bld}XY%{rs} %{bld}REFERENCE%{rs}\n");
 	cfprintf(cout, "      Find files whose %{bld}X%{rs} time is newer than the %{bld}Y%{rs} time of"
-	               " %{bld}REFERENCE%{bld}.  %{bld}X%{rs} and %{bld}Y%{rs}\n");
-	cfprintf(cout, "      can be any of [acm].\n");
+	               " %{bld}REFERENCE%{rs}.  %{bld}X%{rs} and %{bld}Y%{rs}\n");
+	cfprintf(cout, "      can be any of [aBcm].\n");
 	cfprintf(cout, "  %{blu}-regex%{rs} %{bld}REGEX%{rs}\n");
 	cfprintf(cout, "      Find files whose entire path matches the regular expression %{bld}REGEX%{rs}\n");
 	cfprintf(cout, "  %{blu}-samefile%{rs} %{bld}FILE%{rs}\n");
 	cfprintf(cout, "      Find hard links to %{bld}FILE%{rs}\n");
-	cfprintf(cout, "  %{blu}-size%{rs} %{bld}[-+]N[wbkMG]%{rs}\n");
-	cfprintf(cout, "      2-byte %{bld}w%{rs}ords, 512-byte %{bld}b%{rs}locks, and %{bld}k%{rs}iB/%{bld}M%{rs}iB"
-	               "/%{bld}G%{rs}iB\n");
+	cfprintf(cout, "  %{blu}-size%{rs} %{bld}[-+]N[cwbkMG]%{rs}\n");
+	cfprintf(cout, "      1-byte %{bld}c%{rs}haracters, 2-byte %{bld}w%{rs}ords, 512-byte %{bld}b%{rs}locks, and"
+	               " %{bld}k%{rs}iB/%{bld}M%{rs}iB/%{bld}G%{rs}iB\n");
+	cfprintf(cout, "  %{blu}-type%{rs} %{bld}[bcdlpfsD]%{rs}\n");
+	cfprintf(cout, "      The %{bld}D%{rs}oor file type is also supported on platforms that have it (Solaris)\n");
 	cfprintf(cout, "  %{blu}-used%{rs} %{bld}[-+]N%{rs}\n");
 	cfprintf(cout, "      Find files last accessed %{bld}N%{rs} days after they were changed\n");
 	cfprintf(cout, "  %{blu}-wholename%{rs} %{bld}GLOB%{rs}\n");
@@ -2156,7 +2359,7 @@ static struct expr *parse_help(struct parser_state *state, int arg1, int arg2) {
 	cfprintf(cout, "  %{blu}-iwholename%{rs} %{bld}GLOB%{rs}\n");
 	cfprintf(cout, "      Case-insensitive versions of %{blu}-lname%{rs}/%{blu}-name%{rs}/%{blu}-path%{rs}"
 	               "/%{blu}-regex%{rs}/%{blu}-wholename%{rs}\n");
-	cfprintf(cout, "  %{blu}-xtype%{rs} %{bld}[bcdlpfs]%{rs}\n");
+	cfprintf(cout, "  %{blu}-xtype%{rs} %{bld}[bcdlpfsD]%{rs}\n");
 	cfprintf(cout, "      Find files of the given type, following links when %{blu}-type%{rs} would not, and\n");
 	cfprintf(cout, "      vice versa\n\n");
 
@@ -2167,16 +2370,19 @@ static struct expr *parse_help(struct parser_state *state, int arg1, int arg2) {
 	cfprintf(cout, "  %{blu}-okdir%{rs}   %{bld}command ... {} ;%{rs}\n");
 	cfprintf(cout, "      Like %{blu}-exec%{rs}/%{blu}-ok%{rs}, but run the command in the same directory as the found\n");
 	cfprintf(cout, "      file(s)\n");
+	cfprintf(cout, "  %{blu}-ls%{rs}\n");
+	cfprintf(cout, "      List files like %{ex}ls%{rs} %{bld}-dils%{rs}\n");
 	cfprintf(cout, "  %{blu}-print0%{rs}\n");
 	cfprintf(cout, "      Like %{blu}-print%{rs}, but use the null character ('\\0') as a separator rather than\n");
 	cfprintf(cout, "      newlines\n");
 	cfprintf(cout, "  %{blu}-printf%{rs} %{bld}FORMAT%{rs}\n");
 	cfprintf(cout, "      Print according to a format string (see %{ex}man%{rs} %{bld}find%{rs})\n");
+	cfprintf(cout, "  %{blu}-fls%{rs} %{bld}FILE%{rs}\n");
 	cfprintf(cout, "  %{blu}-fprint%{rs} %{bld}FILE%{rs}\n");
 	cfprintf(cout, "  %{blu}-fprint0%{rs} %{bld}FILE%{rs}\n");
 	cfprintf(cout, "  %{blu}-fprintf%{rs} %{bld}FORMAT%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "      Like %{blu}-print%{rs}/%{blu}-print0%{rs}/%{blu}-printf%{rs}, but write to %{bld}FILE%{rs} instead"
-	               " of standard output\n");
+	cfprintf(cout, "      Like %{blu}-ls%{rs}/%{blu}-print%{rs}/%{blu}-print0%{rs}/%{blu}-printf%{rs}, but write to"
+	               " %{bld}FILE%{rs} instead of standard output\n");
 	cfprintf(cout, "  %{blu}-quit%{rs}\n");
 	cfprintf(cout, "      Quit immediately\n\n");
 
@@ -2195,15 +2401,20 @@ static struct expr *parse_help(struct parser_state *state, int arg1, int arg2) {
 	cfprintf(cout, "      Don't descend into other mount points (same as %{blu}-xdev%{rs})\n\n");
 
 	cfprintf(cout, "  %{cyn}-f%{rs} %{mag}PATH%{rs}\n");
-	cfprintf(cout, "      Treat %{mag}PATH%{rs} as a path to search (useful if it may begin with a dash)\n\n");
+	cfprintf(cout, "      Treat %{mag}PATH%{rs} as a path to search (useful if begins with a dash)\n\n");
 
+	cfprintf(cout, "  %{blu}-Bmin%{rs} %{bld}[-+]N%{rs}\n");
+	cfprintf(cout, "  %{blu}-Btime%{rs} %{bld}[-+]N%{rs}\n");
+	cfprintf(cout, "      Find files Birthed %{bld}N%{rs} minutes/days ago\n");
+	cfprintf(cout, "  %{blu}-Bnewer%{rs} %{bld}FILE%{rs}\n");
+	cfprintf(cout, "      Find files Birthed more recently than %{bld}FILE%{rs} was modified\n");
 	cfprintf(cout, "  %{blu}-depth%{rs} %{bld}[-+]N%{rs}\n");
 	cfprintf(cout, "      Find files with depth %{bld}N%{rs}\n");
 	cfprintf(cout, "  %{blu}-gid%{rs} %{bld}NAME%{rs}\n");
 	cfprintf(cout, "  %{blu}-uid%{rs} %{bld}NAME%{rs}\n");
 	cfprintf(cout, "      Group/user names are supported in addition to numeric IDs\n");
-	cfprintf(cout, "  %{blu}-size%{rs} %{bld}[-+]N[TP]%{rs}\n");
-	cfprintf(cout, "      %{bld}T%{rs}iB/%{bld}P%{rs}iB\n");
+	cfprintf(cout, "  %{blu}-size%{rs} %{bld}[-+]N[cwbkMGTP]%{rs}\n");
+	cfprintf(cout, "      Units of %{bld}T%{rs}iB/%{bld}P%{rs}iB are additionally supported\n");
 	cfprintf(cout, "  %{blu}-sparse%{rs}\n");
 	cfprintf(cout, "      Find files that occupy fewer disk blocks than expected\n\n");
 
@@ -2215,15 +2426,33 @@ static struct expr *parse_help(struct parser_state *state, int arg1, int arg2) {
 	cfprintf(cout, "  %{blu}-rm%{rs}\n");
 	cfprintf(cout, "      Delete any found files (same as %{blu}-delete%{rs}; implies %{blu}-depth%{rs})\n\n");
 
-	cfprintf(cout, "%{bld}Extra features:%{rs}\n\n");
+	cfprintf(cout, "%{ex}bfs%{rs}%{bld}-specific features:%{rs}\n\n");
+
+	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}0%{rs}\n");
+	cfprintf(cout, "      Disable all optimizations\n");
+	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}1%{rs}\n");
+	cfprintf(cout, "      Basic logical simplification\n");
+	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}2%{rs}\n");
+	cfprintf(cout, "      All %{cyn}-O%{rs}%{bld}1%{rs} optimizations, plus dead code elimination and data flow analysis\n");
+	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}3%{rs} (default)\n");
+	cfprintf(cout, "      All %{cyn}-O%{rs}%{bld}2%{rs} optimizations, plus re-order expressions to reduce expected cost\n");
+	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}4%{rs}/%{cyn}-O%{rs}%{bld}fast%{rs}\n");
+	cfprintf(cout, "      All optimizations, including aggressive optimizations that may alter the\n");
+	cfprintf(cout, "      observed behavior in corner cases\n\n");
 
 	cfprintf(cout, "  %{blu}-color%{rs}\n");
 	cfprintf(cout, "  %{blu}-nocolor%{rs}\n");
-	cfprintf(cout, "      Turn on or off file type colorization\n\n");
+	cfprintf(cout, "      Turn colors on or off (default: %{blu}-color%{rs} if outputting to a terminal,\n");
+	cfprintf(cout, "      %{blu}-nocolor%{rs} otherwise)\n\n");
 
 	cfprintf(cout, "  %{blu}-hidden%{rs}\n");
 	cfprintf(cout, "  %{blu}-nohidden%{rs}\n");
 	cfprintf(cout, "      Match hidden files, or filter them out\n\n");
+
+	cfprintf(cout, "  %{blu}-printf%{rs} %{bld}FORMAT%{rs}\n");
+	cfprintf(cout, "  %{blu}-fprintf%{rs} %{bld}FORMAT%{rs} %{bld}FILE%{rs}\n");
+	cfprintf(cout, "      The additional format directives %%w and %%W%{bld}k%{rs} for printing file birth times\n");
+	cfprintf(cout, "      are supported.\n\n");
 
 	cfprintf(cout, "%s\n", BFS_HOMEPAGE);
 
@@ -2260,6 +2489,9 @@ struct table_entry {
  * The parse table for literals.
  */
 static const struct table_entry parse_table[] = {
+	{"-Bmin", false, parse_time, BFS_STAT_BTIME, MINUTES},
+	{"-Bnewer", false, parse_newer, BFS_STAT_BTIME},
+	{"-Btime", false, parse_time, BFS_STAT_BTIME, DAYS},
 	{"-D", false, parse_debug},
 	{"-E", false, parse_regex_extended},
 	{"-O", true, parse_optlevel},
@@ -2268,13 +2500,13 @@ static const struct table_entry parse_table[] = {
 	{"-L", false, parse_follow, BFTW_LOGICAL | BFTW_DETECT_CYCLES, false},
 	{"-X", false, parse_xargs_safe},
 	{"-a"},
-	{"-amin", false, parse_acmtime, ATIME, MINUTES},
+	{"-amin", false, parse_time, BFS_STAT_ATIME, MINUTES},
 	{"-and"},
-	{"-atime", false, parse_acmtime, ATIME, DAYS},
-	{"-anewer", false, parse_acnewer, ATIME},
-	{"-cmin", false, parse_acmtime, CTIME, MINUTES},
-	{"-ctime", false, parse_acmtime, CTIME, DAYS},
-	{"-cnewer", false, parse_acnewer, CTIME},
+	{"-anewer", false, parse_newer, BFS_STAT_ATIME},
+	{"-atime", false, parse_time, BFS_STAT_ATIME, DAYS},
+	{"-cmin", false, parse_time, BFS_STAT_CTIME, MINUTES},
+	{"-cnewer", false, parse_newer, BFS_STAT_CTIME},
+	{"-ctime", false, parse_time, BFS_STAT_CTIME, DAYS},
 	{"-color", false, parse_color, true},
 	{"-d", false, parse_depth},
 	{"-daystart", false, parse_daystart},
@@ -2309,12 +2541,12 @@ static const struct table_entry parse_table[] = {
 	{"-ls", false, parse_ls},
 	{"-maxdepth", false, parse_depth_limit, false},
 	{"-mindepth", false, parse_depth_limit, true},
-	{"-mmin", false, parse_acmtime, MTIME, MINUTES},
-	{"-mnewer", false, parse_acnewer, MTIME},
+	{"-mmin", false, parse_time, BFS_STAT_MTIME, MINUTES},
+	{"-mnewer", false, parse_newer, BFS_STAT_MTIME},
 	{"-mount", false, parse_mount},
-	{"-mtime", false, parse_acmtime, MTIME, DAYS},
+	{"-mtime", false, parse_time, BFS_STAT_MTIME, DAYS},
 	{"-name", false, parse_name, false},
-	{"-newer", false, parse_acnewer, MTIME},
+	{"-newer", false, parse_newer, BFS_STAT_MTIME},
 	{"-newer", true, parse_newerxy},
 	{"-nocolor", false, parse_color, false},
 	{"-nogroup", false, parse_nogroup},
@@ -2448,74 +2680,6 @@ unexpected:
 	return NULL;
 }
 
-static struct expr *new_and_expr(const struct parser_state *state, struct expr *lhs, struct expr *rhs, char **argv);
-static struct expr *new_or_expr(const struct parser_state *state, struct expr *lhs, struct expr *rhs, char **argv);
-
-/**
- * Extract a child expression, freeing the outer expression.
- */
-static struct expr *extract_child_expr(struct expr *expr, struct expr **child) {
-	struct expr *ret = *child;
-	*child = NULL;
-	free_expr(expr);
-	return ret;
-}
-
-/**
- * Create a "not" expression.
- */
-static struct expr *new_not_expr(const struct parser_state *state, struct expr *rhs, char **argv) {
-	int optlevel = state->cmdline->optlevel;
-	if (optlevel >= 1) {
-		if (rhs == &expr_true) {
-			debug_opt(state, "-O1: constant propagation: (%s %e) <==> %e\n", argv[0], rhs, &expr_false);
-			return &expr_false;
-		} else if (rhs == &expr_false) {
-			debug_opt(state, "-O1: constant propagation: (%s %e) <==> %e\n", argv[0], rhs, &expr_true);
-			return &expr_true;
-		} else if (expr_never_returns(rhs)) {
-			debug_opt(state, "-O1: reachability: (%s %e) <==> %e\n", argv[0], rhs, rhs);
-			return rhs;
-		} else if (rhs->eval == eval_not) {
-			debug_opt(state, "-O1: double negation: (%s %e) <==> %e\n", argv[0], rhs, rhs->rhs);
-			return extract_child_expr(rhs, &rhs->rhs);
-		} else if ((rhs->eval == eval_and || rhs->eval == eval_or)
-			   && (rhs->lhs->eval == eval_not || rhs->rhs->eval == eval_not)) {
-			bool other_and = rhs->eval == eval_or;
-			char **other_arg = other_and ? &fake_and_arg : &fake_or_arg;
-
-			debug_opt(state, "-O1: De Morgan's laws: (%s %e) <==> (%s (%s %e) (%s %e))\n",
-				  argv[0], rhs,
-				  *other_arg, argv[0], rhs->lhs, argv[0], rhs->rhs);
-
-			struct expr *other_lhs = new_not_expr(state, rhs->lhs, argv);
-			struct expr *other_rhs = new_not_expr(state, rhs->rhs, argv);
-			rhs->rhs = NULL;
-			rhs->lhs = NULL;
-			free_expr(rhs);
-			if (!other_lhs || !other_rhs) {
-				free_expr(other_rhs);
-				free_expr(other_lhs);
-				return NULL;
-			}
-
-			if (other_and) {
-				return new_and_expr(state, other_lhs, other_rhs, other_arg);
-			} else {
-				return new_or_expr(state, other_lhs, other_rhs, other_arg);
-			}
-		}
-	}
-
-	struct expr *expr = new_unary_expr(eval_not, rhs, argv);
-	if (expr) {
-		expr->pure = rhs->pure;
-		expr->always_true = rhs->always_false;
-		expr->always_false = rhs->always_true;
-	}
-	return expr;
-}
-
 /**
  * FACTOR : "(" EXPR ")"
  *        | "!" FACTOR | "-not" FACTOR
@@ -2564,57 +2728,10 @@ static struct expr *parse_factor(struct parser_state *state) {
 			return NULL;
 		}
 
-		return new_not_expr(state, factor, argv);
+		return new_unary_expr(eval_not, factor, argv);
 	} else {
 		return parse_literal(state);
 	}
-}
-
-/**
- * Create an "and" expression.
- */
-static struct expr *new_and_expr(const struct parser_state *state, struct expr *lhs, struct expr *rhs, char **argv) {
-	int optlevel = state->cmdline->optlevel;
-	if (optlevel >= 1) {
-		if (lhs == &expr_true) {
-			debug_opt(state, "-O1: conjunction elimination: (%s %e %e) <==> %e\n", argv[0], lhs, rhs, rhs);
-			return rhs;
-		} else if (rhs == &expr_true) {
-			debug_opt(state, "-O1: conjunction elimination: (%s %e %e) <==> %e\n", argv[0], lhs, rhs, lhs);
-			return lhs;
-		} else if (lhs->always_false) {
-			debug_opt(state, "-O1: short-circuit: (%s %e %e) <==> %e\n", argv[0], lhs, rhs, lhs);
-			free_expr(rhs);
-			return lhs;
-		} else if (optlevel >= 2 && lhs->pure && rhs == &expr_false) {
-			debug_opt(state, "-O2: purity: (%s %e %e) <==> %e\n", argv[0], lhs, rhs, rhs);
-			free_expr(lhs);
-			return rhs;
-		} else if (lhs->eval == eval_not && rhs->eval == eval_not) {
-			char **not_arg = lhs->argv;
-			debug_opt(state, "-O1: De Morgan's laws: (%s %e %e) <==> (%s (%s %e %e))\n",
-			          argv[0], lhs, rhs,
-				  *not_arg, fake_or_arg, lhs->rhs, rhs->rhs);
-
-			lhs = extract_child_expr(lhs, &lhs->rhs);
-			rhs = extract_child_expr(rhs, &rhs->rhs);
-
-			struct expr *or_expr = new_or_expr(state, lhs, rhs, &fake_or_arg);
-			if (!or_expr) {
-				return NULL;
-			}
-
-			return new_not_expr(state, or_expr, not_arg);
-		}
-	}
-
-	struct expr *expr = new_binary_expr(eval_and, lhs, rhs, argv);
-	if (expr) {
-		expr->pure = lhs->pure && rhs->pure;
-		expr->always_true = lhs->always_true && rhs->always_true;
-		expr->always_false = lhs->always_false || rhs->always_false;
-	}
-	return expr;
 }
 
 /**
@@ -2655,57 +2772,10 @@ static struct expr *parse_term(struct parser_state *state) {
 			return NULL;
 		}
 
-		term = new_and_expr(state, lhs, rhs, argv);
+		term = new_binary_expr(eval_and, lhs, rhs, argv);
 	}
 
 	return term;
-}
-
-/**
- * Create an "or" expression.
- */
-static struct expr *new_or_expr(const struct parser_state *state, struct expr *lhs, struct expr *rhs, char **argv) {
-	int optlevel = state->cmdline->optlevel;
-	if (optlevel >= 1) {
-		if (lhs->always_true) {
-			debug_opt(state, "-O1: short-circuit: (%s %e %e) <==> %e\n", argv[0], lhs, rhs, lhs);
-			free_expr(rhs);
-			return lhs;
-		} else if (lhs == &expr_false) {
-			debug_opt(state, "-O1: disjunctive syllogism: (%s %e %e) <==> %e\n", argv[0], lhs, rhs, rhs);
-			return rhs;
-		} else if (rhs == &expr_false) {
-			debug_opt(state, "-O1: disjunctive syllogism: (%s %e %e) <==> %e\n", argv[0], lhs, rhs, lhs);
-			return lhs;
-		} else if (optlevel >= 2 && lhs->pure && rhs == &expr_true) {
-			debug_opt(state, "-O2: purity: (%s %e %e) <==> %e\n", argv[0], lhs, rhs, rhs);
-			free_expr(lhs);
-			return rhs;
-		} else if (lhs->eval == eval_not && rhs->eval == eval_not) {
-			char **not_arg = lhs->argv;
-			debug_opt(state, "-O1: De Morgan's laws: (%s %e %e) <==> (%s (%s %e %e))\n",
-			          argv[0], lhs, rhs,
-				  *not_arg, fake_and_arg, lhs->rhs, rhs->rhs);
-
-			lhs = extract_child_expr(lhs, &lhs->rhs);
-			rhs = extract_child_expr(rhs, &rhs->rhs);
-
-			struct expr *and_expr = new_and_expr(state, lhs, rhs, &fake_and_arg);
-			if (!and_expr) {
-				return NULL;
-			}
-
-			return new_not_expr(state, and_expr, not_arg);
-		}
-	}
-
-	struct expr *expr = new_binary_expr(eval_or, lhs, rhs, argv);
-	if (expr) {
-		expr->pure = lhs->pure && rhs->pure;
-		expr->always_true = lhs->always_true || rhs->always_true;
-		expr->always_false = lhs->always_false && rhs->always_false;
-	}
-	return expr;
 }
 
 /**
@@ -2740,45 +2810,10 @@ static struct expr *parse_clause(struct parser_state *state) {
 			return NULL;
 		}
 
-		clause = new_or_expr(state, lhs, rhs, argv);
+		clause = new_binary_expr(eval_or, lhs, rhs, argv);
 	}
 
 	return clause;
-}
-
-/**
- * Create a "comma" expression.
- */
-static struct expr *new_comma_expr(const struct parser_state *state, struct expr *lhs, struct expr *rhs, char **argv) {
-	int optlevel = state->cmdline->optlevel;
-	if (optlevel >= 1) {
-		if (lhs->eval == eval_not) {
-			debug_opt(state, "-O1: ignored result: (%s %e %e) <==> (%s %e %e)\n",
-			          argv[0], lhs, rhs,
-				  argv[0], lhs->rhs, rhs);
-			lhs = extract_child_expr(lhs, &lhs->rhs);
-		}
-
-		if (expr_never_returns(lhs)) {
-			debug_opt(state, "-O1: reachability: (%s %e %e) <==> %e\n", argv[0], lhs, rhs, lhs);
-			free_expr(rhs);
-			return lhs;
-		}
-
-		if (optlevel >= 2 && lhs->pure) {
-			debug_opt(state, "-O2: purity: (%s %e %e) <==> %e\n", argv[0], lhs, rhs, rhs);
-			free_expr(lhs);
-			return rhs;
-		}
-	}
-
-	struct expr *expr = new_binary_expr(eval_comma, lhs, rhs, argv);
-	if (expr) {
-		expr->pure = lhs->pure && rhs->pure;
-		expr->always_true = expr_never_returns(lhs) || rhs->always_true;
-		expr->always_false = expr_never_returns(lhs) || rhs->always_false;
-	}
-	return expr;
 }
 
 /**
@@ -2812,38 +2847,7 @@ static struct expr *parse_expr(struct parser_state *state) {
 			return NULL;
 		}
 
-		expr = new_comma_expr(state, lhs, rhs, argv);
-	}
-
-	return expr;
-}
-
-/**
- * Apply top-level optimizations.
- */
-static struct expr *optimize_whole_expr(const struct parser_state *state, struct expr *expr) {
-	int optlevel = state->cmdline->optlevel;
-
-	if (optlevel >= 1) {
-		while (true) {
-			if (expr->eval == eval_not) {
-				debug_opt(state, "-O1: ignored result: %e --> %e\n", expr, expr->rhs);
-				expr = extract_child_expr(expr, &expr->rhs);
-			} else if (optlevel >= 2
-			           && (expr->eval == eval_and || expr->eval == eval_or || expr->eval == eval_comma)
-			           && expr->rhs->pure) {
-				debug_opt(state, "-O2: ignored result: %e --> %e\n", expr, expr->lhs);
-				expr = extract_child_expr(expr, &expr->lhs);
-			} else {
-				break;
-			}
-		}
-	}
-
-	if (optlevel >= 4 && expr->pure && expr != &expr_false) {
-		debug_opt(state, "-O4: top-level purity: %e --> %e\n", expr, &expr_false);
-		free_expr(expr);
-		expr = &expr_false;
+		expr = new_binary_expr(eval_comma, lhs, rhs, argv);
 	}
 
 	return expr;
@@ -2877,15 +2881,13 @@ static struct expr *parse_whole_expr(struct parser_state *state) {
 		if (!print) {
 			goto fail;
 		}
-		print->cfile = state->cmdline->cout;
+		init_print_expr(state, print);
 
-		expr = new_and_expr(state, expr, print, &fake_and_arg);
+		expr = new_binary_expr(eval_and, expr, print, &fake_and_arg);
 		if (!expr) {
 			goto fail;
 		}
 	}
-
-	expr = optimize_whole_expr(state, expr);
 
 	if (state->warn && state->depth_arg && state->prune_arg) {
 		cfprintf(cerr, "%{wr}warning: %s does not work in the presence of %s.%{rs}\n", state->prune_arg, state->depth_arg);
@@ -2925,6 +2927,9 @@ void dump_cmdline(const struct cmdline *cmdline, bool verbose) {
 		cfprintf(cerr, "%{cyn}-O%d%{rs} ", cmdline->optlevel);
 	}
 
+	if (cmdline->debug & DEBUG_COST) {
+		cfprintf(cerr, "%{cyn}-D%{rs} %{bld}cost%{rs} ");
+	}
 	if (cmdline->debug & DEBUG_EXEC) {
 		cfprintf(cerr, "%{cyn}-D%{rs} %{bld}exec%{rs} ");
 	}
@@ -2976,6 +2981,16 @@ void dump_cmdline(const struct cmdline *cmdline, bool verbose) {
 }
 
 /**
+ * Dump the estimated costs.
+ */
+static void dump_costs(const struct cmdline *cmdline) {
+	CFILE *cerr = cmdline->cerr;
+	const struct expr *expr = cmdline->expr;
+	cfprintf(cerr, "       Cost: ~%{ylw}%g%{rs}\n", expr->cost);
+	cfprintf(cerr, "Probability: ~%{ylw}%g%%%{rs}\n", 100.0*expr->probability);
+}
+
+/**
  * Get the current time.
  */
 static int parse_gettime(struct timespec *ts) {
@@ -3022,10 +3037,12 @@ struct cmdline *parse_cmdline(int argc, char *argv[]) {
 	cmdline->xargs_safe = false;
 	cmdline->ignore_races = false;
 	cmdline->expr = &expr_true;
+	cmdline->open_files = NULL;
 	cmdline->nopen_files = 0;
 
 	cmdline->argv = malloc((argc + 1)*sizeof(*cmdline->argv));
 	if (!cmdline->argv) {
+		perror("malloc()");
 		goto fail;
 	}
 	for (int i = 0; i <= argc; ++i) {
@@ -3072,6 +3089,10 @@ struct cmdline *parse_cmdline(int argc, char *argv[]) {
 		}
 	}
 
+	if (optimize_cmdline(cmdline) != 0) {
+		goto fail;
+	}
+
 	if (!cmdline->roots) {
 		if (parse_root(&state, ".") != 0) {
 			goto fail;
@@ -3080,6 +3101,9 @@ struct cmdline *parse_cmdline(int argc, char *argv[]) {
 
 	if (cmdline->debug & DEBUG_TREE) {
 		dump_cmdline(cmdline, false);
+	}
+	if (cmdline->debug & DEBUG_COST) {
+		dump_costs(cmdline);
 	}
 
 done:

@@ -24,10 +24,22 @@ export TZ=UTC
 
 # The temporary directory that will hold our test data
 TMP="$(mktemp -d "${TMPDIR:-/tmp}"/bfs.XXXXXXXXXX)"
-chown "$(id -u)":"$(id -g)" "$TMP"
+chown "$(id -u):$(id -g)" "$TMP"
 
 # Clean up temporary directories on exit
+CLEAN=yes
 function cleanup() {
+    if [ ! "$CLEAN" ]; then
+        return
+    fi
+
+    # Don't force rm to deal with long paths
+    for dir in "$TMP"/deep/*/*; do
+        if [ -d "$dir" ]; then
+            (cd "$dir" && rm -rf *)
+        fi
+    done
+
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -61,6 +73,7 @@ make_basic "$TMP/basic"
 
 # Creates a file+directory structure with various permissions for tests
 function make_perms() {
+    installp -m000 /dev/null "$1/0"
     installp -m444 /dev/null "$1/r"
     installp -m222 /dev/null "$1/w"
     installp -m644 /dev/null "$1/rw"
@@ -72,14 +85,15 @@ make_perms "$TMP/perms"
 
 # Creates a file+directory structure with various symbolic and hard links
 function make_links() {
-    touchp "$1/a"
-    ln -s a "$1/b"
-    ln "$1/a" "$1/c"
-    mkdir -p "$1/d/e/f"
-    ln -s ../../d "$1/d/e/g"
-    ln -s d/e "$1/h"
-    ln -s q "$1/d/e/i"
-    ln -s b/c "$1/j"
+    touchp "$1/file"
+    ln -s file "$1/symlink"
+    ln "$1/file" "$1/hardlink"
+    ln -s nowhere "$1/broken"
+    ln -s symlink/file "$1/notdir"
+    ln -s loop "$1/loop"
+    mkdir -p "$1/deeply/nested/dir"
+    ln -s ../../deeply "$1/deeply/nested/loop"
+    ln -s deeply/nested/loop/nested "$1/skip"
 }
 make_links "$TMP/links"
 
@@ -120,7 +134,7 @@ function make_deep() {
     name="${name}${name}${name}${name}"
     name="${name:0:255}"
 
-    for i in {1..8}; do
+    for i in {0..9} A B C D E F; do
         (
             mkdir "$1/$i"
             cd "$1/$i"
@@ -128,7 +142,7 @@ function make_deep() {
             # 17 * 256 > 16 * 256 == 4096 == PATH_MAX
             for j in {1..17}; do
                 mkdir "$name"
-                cd "$name"
+                cd "$name" 2>/dev/null
             done
         )
     done
@@ -163,6 +177,7 @@ posix_tests=(
     test_depth_mindepth_2
     test_depth_maxdepth_1
     test_depth_maxdepth_2
+    test_depth_error
     test_name
     test_name_root
     test_name_root_depth
@@ -176,8 +191,11 @@ posix_tests=(
     test_H
     test_H_slash
     test_H_broken
+    test_H_notdir
     test_H_newer
     test_L
+    test_L_broken
+    test_L_notdir
     test_L_depth
     test_user_name
     test_user_id
@@ -191,6 +209,8 @@ posix_tests=(
     test_exec_plus_status
     test_exec_plus_semicolon
     test_flag_comma
+    test_perm_000
+    test_perm_000_minus
     test_perm_222
     test_perm_222_minus
     test_perm_644
@@ -207,7 +227,11 @@ posix_tests=(
     test_a
     test_o
     test_deep
-    test_deep_strict
+    test_double_negation
+    test_de_morgan_not
+    test_de_morgan_and
+    test_de_morgan_or
+    test_data_flow_type
 )
 
 bsd_tests=(
@@ -218,8 +242,13 @@ bsd_tests=(
     test_samefile
     test_samefile_symlink
     test_H_samefile_symlink
+    test_L_samefile_symlink
     test_samefile_broken
     test_H_samefile_broken
+    test_L_samefile_broken
+    test_samefile_notdir
+    test_H_samefile_notdir
+    test_L_samefile_notdir
     test_name_slash
     test_name_slashes
     test_iname
@@ -240,6 +269,7 @@ bsd_tests=(
     test_ok_stdin
     test_okdir_stdin
     test_delete
+    test_L_delete
     test_rm
     test_regex
     test_iregex
@@ -253,10 +283,14 @@ bsd_tests=(
     test_depth_depth_n
     test_depth_depth_n_plus
     test_depth_depth_n_minus
+    test_depth_overflow
     test_gid_name
     test_uid_name
     test_mnewer
     test_H_mnewer
+    test_perm_000_plus
+    test_perm_222_plus
+    test_perm_644_plus
     test_size_T
     test_quit
     test_quit_child
@@ -270,6 +304,7 @@ bsd_tests=(
     test_nouser
     test_exit
     test_printx
+    test_data_flow_depth
 )
 
 gnu_tests=(
@@ -292,8 +327,13 @@ gnu_tests=(
     test_samefile
     test_samefile_symlink
     test_H_samefile_symlink
+    test_L_samefile_symlink
     test_samefile_broken
     test_H_samefile_broken
+    test_L_samefile_broken
+    test_samefile_notdir
+    test_H_samefile_notdir
+    test_L_samefile_notdir
     test_xtype_l
     test_xtype_f
     test_L_xtype_l
@@ -323,16 +363,19 @@ gnu_tests=(
     test_flag_weird_names
     test_follow_comma
     test_fprint
+    test_fprint_duplicate
     test_double_dash
     test_flag_double_dash
     test_ignore_readdir_race
     test_ignore_readdir_race_root
     test_ignore_readdir_race_notdir
+    test_perm_000_slash
     test_perm_222_slash
     test_perm_644_slash
     test_perm_symbolic_slash
     test_perm_leading_plus_symbolic_slash
     test_delete
+    test_L_delete
     test_regex
     test_iregex
     test_regex_parens
@@ -357,6 +400,7 @@ gnu_tests=(
     test_printf_times
     test_printf_leak
     test_printf_nul
+    test_printf_Y_error
     test_quit_after_print
     test_quit_before_print
     test_fstype
@@ -367,25 +411,32 @@ gnu_tests=(
     test_precedence
     test_and_purity
     test_or_purity
+    test_not_reachability
+    test_comma_reachability
+    test_print_error
+    test_fprint_error
 )
 
 bfs_tests=(
     test_type_multi
     test_xtype_multi
+    test_xtype_reorder
     test_perm_symbolic_trailing_comma
     test_perm_symbolic_double_comma
     test_perm_symbolic_missing_action
     test_perm_leading_plus_symbolic
-    test_perm_octal_plus
     test_execdir_plus
     test_hidden
     test_nohidden
+    test_printf_w
     test_path_flag_expr
     test_path_expr_flag
     test_flag_expr_path
     test_expr_flag_path
     test_expr_path_flag
     test_colors
+    test_deep_strict
+    test_deep_stricter
 )
 
 BSD=yes
@@ -423,6 +474,9 @@ for arg; do
             GNU=yes
             ALL=yes
             ;;
+        --noclean)
+            CLEAN=
+            ;;
         --update)
             UPDATE=yes
             ;;
@@ -440,7 +494,11 @@ for arg; do
     esac
 done
 
-if [ -z "$EXPLICIT" ]; then
+if [ ! "$CLEAN" ]; then
+    echo "Test files saved to $TMP"
+fi
+
+if [ ! "$EXPLICIT" ]; then
     enable_tests "${posix_tests[@]}"
     [ "$BSD" ] && enable_tests "${bsd_tests[@]}"
     [ "$GNU" ] && enable_tests "${gnu_tests[@]}"
@@ -499,21 +557,33 @@ function bfs_diff() (
     # substitution, even with low ulimit -n
     exec 3>&-
 
-    local OUT="$TESTS/${FUNCNAME[1]}.out"
+    local EXPECTED="$TESTS/${FUNCNAME[1]}.out"
     if [ "$UPDATE" ]; then
-        $BFS "$@" | bfs_sort >"$OUT"
+        local ACTUAL="$EXPECTED"
     else
-        diff -u "$OUT" <($BFS "$@" | bfs_sort)
+        local ACTUAL="$TMP/${FUNCNAME[1]}.out"
+    fi
+
+    $BFS "$@" | bfs_sort >"$ACTUAL"
+
+    if [ ! "$UPDATE" ]; then
+        diff -u "$EXPECTED" "$ACTUAL"
     fi
 )
 
 function closefrom() {
-    for fd in /dev/fd/*; do
+    if [ -d /proc/self/fd ]; then
+        local fds=/proc/self/fd
+    else
+        local fds=/dev/fd
+    fi
+
+    for fd in "$fds"/*; do
         if [ ! -e "$fd" ]; then
             continue
         fi
 
-        fd="${fd##*/}"
+        local fd="${fd##*/}"
         if [ "$fd" -ge "$1" ]; then
             eval "exec ${fd}<&-"
         fi
@@ -570,6 +640,20 @@ function test_depth_maxdepth_1() {
 
 function test_depth_maxdepth_2() {
     bfs_diff basic -maxdepth 2 -depth
+}
+
+function test_depth_error() {
+    rm -rf scratch/*
+    touchp scratch/foo/bar
+    chmod -r scratch/foo
+
+    bfs_diff scratch -depth 2>/dev/null
+    local ret=$?
+
+    chmod +r scratch/foo
+    rm -rf scratch/*
+
+    return $ret
 }
 
 function test_name() {
@@ -673,23 +757,27 @@ function test_links_minus() {
 }
 
 function test_P() {
-    bfs_diff -P links/d/e/f
+    bfs_diff -P links/deeply/nested/dir
 }
 
 function test_P_slash() {
-    bfs_diff -P links/d/e/f/
+    bfs_diff -P links/deeply/nested/dir/
 }
 
 function test_H() {
-    bfs_diff -H links/d/e/f
+    bfs_diff -H links/deeply/nested/dir
 }
 
 function test_H_slash() {
-    bfs_diff -H links/d/e/f/
+    bfs_diff -H links/deeply/nested/dir/
 }
 
 function test_H_broken() {
-    bfs_diff -H links/d/e/i
+    bfs_diff -H links/broken
+}
+
+function test_H_notdir() {
+    bfs_diff -H links/notdir
 }
 
 function test_H_newer() {
@@ -698,6 +786,14 @@ function test_H_newer() {
 
 function test_L() {
     bfs_diff -L links 2>/dev/null
+}
+
+function test_L_broken() {
+    bfs_diff -H links/broken
+}
+
+function test_L_notdir() {
+    bfs_diff -H links/notdir
 }
 
 function test_X() {
@@ -713,31 +809,51 @@ function test_L_depth() {
 }
 
 function test_samefile() {
-    bfs_diff links -samefile links/a
+    bfs_diff links -samefile links/file
 }
 
 function test_samefile_symlink() {
-    bfs_diff links -samefile links/b
+    bfs_diff links -samefile links/symlink
 }
 
 function test_H_samefile_symlink() {
-    bfs_diff -H links -samefile links/b
+    bfs_diff -H links -samefile links/symlink
+}
+
+function test_L_samefile_symlink() {
+    bfs_diff -L links -samefile links/symlink 2>/dev/null
 }
 
 function test_samefile_broken() {
-    bfs_diff links -samefile links/d/e/i
+    bfs_diff links -samefile links/broken
 }
 
 function test_H_samefile_broken() {
-    bfs_diff -H links -samefile links/d/e/i
+    bfs_diff -H links -samefile links/broken
+}
+
+function test_L_samefile_broken() {
+    bfs_diff -L links -samefile links/broken 2>/dev/null
+}
+
+function test_samefile_notdir() {
+    bfs_diff links -samefile links/notdir
+}
+
+function test_H_samefile_notdir() {
+    bfs_diff -H links -samefile links/notdir
+}
+
+function test_L_samefile_notdir() {
+    bfs_diff -L links -samefile links/notdir 2>/dev/null
 }
 
 function test_xtype_l() {
-    bfs_diff links -xtype l
+    bfs_diff links -xtype l 2>/dev/null
 }
 
 function test_xtype_f() {
-    bfs_diff links -xtype f
+    bfs_diff links -xtype f 2>/dev/null
 }
 
 function test_L_xtype_l() {
@@ -749,7 +865,14 @@ function test_L_xtype_f() {
 }
 
 function test_xtype_multi() {
-    bfs_diff links -xtype f,d,c
+    bfs_diff links -xtype f,d,c 2>/dev/null
+}
+
+function test_xtype_reorder() {
+    # Make sure -xtype is not reordered in front of anything -- if -xtype runs
+    # before -links 100, it will report an ELOOP error
+    bfs_diff links -links 100 -xtype l
+    invoke_bfs links -links 100 -xtype l
 }
 
 function test_iname() {
@@ -905,13 +1028,28 @@ function test_follow_comma() {
 }
 
 function test_fprint() {
+    invoke_bfs basic -fprint scratch/test_fprint.out
+    sort -o scratch/test_fprint.out scratch/test_fprint.out
+
     if [ "$UPDATE" ]; then
-        invoke_bfs basic -fprint "$TESTS/test_fprint.out"
-        sort -o "$TESTS/test_fprint.out" "$TESTS/test_fprint.out"
+        cp scratch/test_fprint.out "$TESTS/test_fprint.out"
     else
-        invoke_bfs basic -fprint scratch/test_fprint.out
-        sort -o scratch/test_fprint.out scratch/test_fprint.out
         diff -u scratch/test_fprint.out "$TESTS/test_fprint.out"
+    fi
+}
+
+function test_fprint_duplicate() {
+    touchp scratch/test_fprint_duplicate.out
+    ln scratch/test_fprint_duplicate.out scratch/test_fprint_duplicate.hard
+    ln -s test_fprint_duplicate.out scratch/test_fprint_duplicate.soft
+
+    invoke_bfs basic -fprint scratch/test_fprint_duplicate.out -fprint scratch/test_fprint_duplicate.hard -fprint scratch/test_fprint_duplicate.soft
+    sort -o scratch/test_fprint_duplicate.out scratch/test_fprint_duplicate.out
+
+    if [ "$UPDATE" ]; then
+        cp scratch/test_fprint_duplicate.out "$TESTS/test_fprint_duplicate.out"
+    else
+        diff -u scratch/test_fprint_duplicate.out "$TESTS/test_fprint_duplicate.out"
     fi
 }
 
@@ -946,6 +1084,22 @@ function test_ignore_readdir_race_notdir() {
     invoke_bfs scratch -mindepth 1 -ignore_readdir_race -execdir rm -r '{}' \; -execdir touch '{}' \;
 }
 
+function test_perm_000() {
+    bfs_diff perms -perm 000
+}
+
+function test_perm_000_minus() {
+    bfs_diff perms -perm -000
+}
+
+function test_perm_000_slash() {
+    bfs_diff perms -perm /000
+}
+
+function test_perm_000_plus() {
+    bfs_diff perms -perm +000
+}
+
 function test_perm_222() {
     bfs_diff perms -perm 222
 }
@@ -958,6 +1112,10 @@ function test_perm_222_slash() {
     bfs_diff perms -perm /222
 }
 
+function test_perm_222_plus() {
+    bfs_diff perms -perm +222
+}
+
 function test_perm_644() {
     bfs_diff perms -perm 644
 }
@@ -968,6 +1126,10 @@ function test_perm_644_minus() {
 
 function test_perm_644_slash() {
     bfs_diff perms -perm /644
+}
+
+function test_perm_644_plus() {
+    bfs_diff perms -perm +644
 }
 
 function test_perm_symbolic() {
@@ -1006,10 +1168,6 @@ function test_perm_leading_plus_symbolic_slash() {
     bfs_diff perms -perm /+rwx
 }
 
-function test_perm_octal_plus() {
-    ! invoke_bfs perms -perm +777 2>/dev/null
-}
-
 function test_permcopy() {
     bfs_diff perms -perm u+rw,g+u-w,o=g
 }
@@ -1039,6 +1197,18 @@ function test_delete() {
 
     # Don't try to delete '.'
     (cd scratch && invoke_bfs -delete)
+
+    bfs_diff scratch
+}
+
+function test_L_delete() {
+    rm -rf scratch/*
+    mkdir scratch/foo
+    mkdir scratch/bar
+    ln -s ../foo scratch/bar/baz
+
+    # Don't try to rmdir() a symlink
+    invoke_bfs -L scratch/bar -delete || return 1
 
     bfs_diff scratch
 }
@@ -1125,6 +1295,10 @@ function test_depth_depth_n_minus() {
     bfs_diff basic -depth -depth -2
 }
 
+function test_depth_overflow() {
+    bfs_diff basic -depth -4294967296
+}
+
 function test_gid_name() {
     bfs_diff basic -gid "$(id -gn)"
 }
@@ -1174,7 +1348,7 @@ function test_quit_implicit_print() {
 }
 
 function test_inum() {
-    local inode="$(ls -id basic/k/foo/bar | cut -f1 -d' ')"
+    local inode="$(ls -id basic/k/foo/bar | awk '{ print $1 }')"
     bfs_diff basic -inum "$inode"
 }
 
@@ -1229,38 +1403,63 @@ function test_printf_leak() {
 
 function test_printf_nul() {
     # NUL byte regression test
-    local OUT="$TESTS/${FUNCNAME[0]}.out"
-    local ARGS=(basic -maxdepth 0 -printf '%h\0%f\n')
+    local EXPECTED="$TESTS/${FUNCNAME[0]}.out"
     if [ "$UPDATE" ]; then
-        invoke_bfs "${ARGS[@]}" >"$OUT"
+        local ACTUAL="$EXPECTED"
     else
-        diff -u "$OUT" <(invoke_bfs "${ARGS[@]}")
+        local ACTUAL="$TMP/${FUNCNAME[0]}.out"
+    fi
+
+    invoke_bfs basic -maxdepth 0 -printf '%h\0%f\n' >"$ACTUAL"
+
+    if [ ! "$UPDATE" ]; then
+        diff -u "$EXPECTED" "$ACTUAL"
     fi
 }
 
+function test_printf_w() {
+    # Birth times may not be supported, so just check that %w/%W/%B can be parsed
+    bfs_diff times -false -printf '%w %WY %BY\n'
+}
+
+function test_printf_Y_error() {
+    rm -rf scratch/*
+    mkdir scratch/foo
+    chmod -x scratch/foo
+    ln -s foo/bar scratch/bar
+
+    bfs_diff scratch -printf '(%p) (%l) %y %Y\n' 2>/dev/null
+    local ret=$?
+
+    chmod +x scratch/foo
+    rm -rf scratch/*
+
+    return $ret
+}
+
 function test_fstype() {
-    fstype="$(invoke_bfs -printf '%F\n' | head -n1)"
+    fstype="$(invoke_bfs basic -maxdepth 0 -printf '%F\n')"
     bfs_diff basic -fstype "$fstype"
 }
 
 function test_path_flag_expr() {
-    bfs_diff links/h -H -type l
+    bfs_diff links/skip -H -type l
 }
 
 function test_path_expr_flag() {
-    bfs_diff links/h -type l -H
+    bfs_diff links/skip -type l -H
 }
 
 function test_flag_expr_path() {
-    bfs_diff -H -type l links/h
+    bfs_diff -H -type l links/skip
 }
 
 function test_expr_flag_path() {
-    bfs_diff -type l -H links/h
+    bfs_diff -type l -H links/skip
 }
 
 function test_expr_path_flag() {
-    bfs_diff -type l links/h -H
+    bfs_diff -type l links/skip -H
 }
 
 function test_parens() {
@@ -1310,17 +1509,24 @@ function test_colors() {
 function test_deep() {
     closefrom 4
 
-    ulimit -n 8
-    bfs_diff deep -mindepth 18
+    ulimit -n 16
+    bfs_diff deep -mindepth 18 -exec /bin/bash -c 'echo "${1:0:6}/.../${1##*/} (${#1})"' /bin/bash '{}' \;
 }
 
 function test_deep_strict() {
-    # Low ulimit would interfere with the dup()'d stdout for verbose logging
     closefrom 4
 
     # Not even enough fds to keep the root open
+    ulimit -n 7
+    bfs_diff deep -mindepth 18 -exec /bin/bash -c 'echo "${1:0:6}/.../${1##*/} (${#1})"' /bin/bash '{}' \;
+}
+
+function test_deep_stricter() {
+    closefrom 4
+
+    # So few fds that pipe() fails in the -exec implementation
     ulimit -n 6
-    bfs_diff deep -mindepth 18
+    bfs_diff deep -mindepth 18 -exec /bin/bash -c 'echo "${1:0:6}/.../${1##*/} (${#1})"' /bin/bash '{}' \;
 }
 
 function test_exit() {
@@ -1351,6 +1557,50 @@ function test_or_purity() {
     bfs_diff basic -name '*' -o -print
 }
 
+function test_double_negation() {
+    bfs_diff basic \! \! -name 'foo'
+}
+
+function test_not_reachability() {
+    bfs_diff basic -print \! -quit -print
+}
+
+function test_comma_reachability() {
+    bfs_diff basic -print -quit , -print
+}
+
+function test_de_morgan_not() {
+    bfs_diff basic \! \( -name 'foo' -o \! -type f \)
+}
+
+function test_de_morgan_and() {
+    bfs_diff basic \( \! -name 'foo' -a \! -type f \)
+}
+
+function test_de_morgan_or() {
+    bfs_diff basic \( \! -name 'foo' -o \! -type f \)
+}
+
+function test_data_flow_depth() {
+    bfs_diff basic -depth +1 -depth -4
+}
+
+function test_data_flow_type() {
+    bfs_diff basic \! \( -type f -o \! -type f \)
+}
+
+function test_print_error() {
+    if [ -e /dev/full ]; then
+        ! invoke_bfs basic -maxdepth 0 >/dev/full 2>/dev/null
+    fi
+}
+
+function test_fprint_error() {
+    if [ -e /dev/full ]; then
+        ! invoke_bfs basic -maxdepth 0 -fprint /dev/full 2>/dev/null
+    fi
+}
+
 if [ -t 1 -a ! "$VERBOSE" ]; then
     in_place=yes
 fi
@@ -1374,7 +1624,11 @@ for test in ${!run_*}; do
         ((++passed))
     else
         ((++failed))
-        echo "$test failed!"
+        if [ "$in_place" ]; then
+            printf '\r\033[J%s\n' "$test failed!"
+        else
+            echo "$test failed!"
+        fi
     fi
 done
 

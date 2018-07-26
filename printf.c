@@ -15,10 +15,12 @@
  ****************************************************************************/
 
 #include "printf.h"
-#include "bfs.h"
+#include "cmdline.h"
 #include "color.h"
 #include "dstring.h"
+#include "expr.h"
 #include "mtab.h"
+#include "stat.h"
 #include "util.h"
 #include <assert.h>
 #include <errno.h>
@@ -28,7 +30,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
 
 typedef int bfs_printf_fn(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf);
@@ -41,8 +42,8 @@ struct bfs_printf_directive {
 	bfs_printf_fn *fn;
 	/** String data associated with this directive. */
 	char *str;
-	/** The time field to print. */
-	enum time_field time_field;
+	/** The stat field to print. */
+	enum bfs_stat_field stat_field;
 	/** Character data associated with this directive. */
 	char c;
 	/** The current mount table. */
@@ -76,29 +77,40 @@ static int bfs_printf_flush(FILE *file, const struct bfs_printf_directive *direc
 	(void)ret
 
 /**
- * Get a particular time field from a struct stat.
+ * Get a particular time field from a struct bfs_stat.
  */
-static const struct timespec *get_time_field(const struct stat *statbuf, enum time_field time_field) {
-	switch (time_field) {
-	case ATIME:
-		return &statbuf->st_atim;
-	case CTIME:
-		return &statbuf->st_ctim;
-	case MTIME:
-		return &statbuf->st_mtim;
+static const struct timespec *get_time_field(const struct bfs_stat *statbuf, enum bfs_stat_field stat_field) {
+	if (!(statbuf->mask & stat_field)) {
+		errno = ENOTSUP;
+		return NULL;
 	}
 
-	assert(false);
-	return NULL;
+	switch (stat_field) {
+	case BFS_STAT_ATIME:
+		return &statbuf->atime;
+	case BFS_STAT_BTIME:
+		return &statbuf->btime;
+	case BFS_STAT_CTIME:
+		return &statbuf->ctime;
+	case BFS_STAT_MTIME:
+		return &statbuf->mtime;
+	default:
+		assert(false);
+		return NULL;
+	}
 }
 
-/** %c, %c, and %t: ctime() */
+/** %a, %c, %t: ctime() */
 static int bfs_printf_ctime(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
 	// Not using ctime() itself because GNU find adds nanoseconds
 	static const char *days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 	static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
-	const struct timespec *ts = get_time_field(ftwbuf->statbuf, directive->time_field);
+	const struct timespec *ts = get_time_field(ftwbuf->statbuf, directive->stat_field);
+	if (!ts) {
+		return -1;
+	}
+
 	struct tm tm;
 	if (xlocaltime(&ts->tv_sec, &tm) != 0) {
 		return -1;
@@ -117,9 +129,13 @@ static int bfs_printf_ctime(FILE *file, const struct bfs_printf_directive *direc
 	return fprintf(file, directive->str, buf);
 }
 
-/** %A, %C, %T: strftime() */
+/** %A, %B/%W, %C, %T: strftime() */
 static int bfs_printf_strftime(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	const struct timespec *ts = get_time_field(ftwbuf->statbuf, directive->time_field);
+	const struct timespec *ts = get_time_field(ftwbuf->statbuf, directive->stat_field);
+	if (!ts) {
+		return -1;
+	}
+
 	struct tm tm;
 	if (xlocaltime(&ts->tv_sec, &tm) != 0) {
 		return -1;
@@ -133,15 +149,6 @@ static int bfs_printf_strftime(FILE *file, const struct bfs_printf_directive *di
 	case '@':
 		ret = snprintf(buf, sizeof(buf), "%lld.%09ld0", (long long)ts->tv_sec, (long)ts->tv_nsec);
 		break;
-	case 'k':
-		ret = snprintf(buf, sizeof(buf), "%2d", tm.tm_hour);
-		break;
-	case 'l':
-		ret = snprintf(buf, sizeof(buf), "%2d", (tm.tm_hour + 11)%12 + 1);
-		break;
-	case 'S':
-		ret = snprintf(buf, sizeof(buf), "%.2d.%09ld0", tm.tm_sec, (long)ts->tv_nsec);
-		break;
 	case '+':
 		ret = snprintf(buf, sizeof(buf), "%4d-%.2d-%.2d+%.2d:%.2d:%.2d.%09ld0",
 		               1900 + tm.tm_year,
@@ -151,6 +158,25 @@ static int bfs_printf_strftime(FILE *file, const struct bfs_printf_directive *di
 		               tm.tm_min,
 		               tm.tm_sec,
 		               (long)ts->tv_nsec);
+		break;
+	case 'k':
+		ret = snprintf(buf, sizeof(buf), "%2d", tm.tm_hour);
+		break;
+	case 'l':
+		ret = snprintf(buf, sizeof(buf), "%2d", (tm.tm_hour + 11)%12 + 1);
+		break;
+	case 's':
+		ret = snprintf(buf, sizeof(buf), "%lld", (long long)ts->tv_sec);
+		break;
+	case 'S':
+		ret = snprintf(buf, sizeof(buf), "%.2d.%09ld0", tm.tm_sec, (long)ts->tv_nsec);
+		break;
+	case 'T':
+		ret = snprintf(buf, sizeof(buf), "%.2d:%.2d:%.2d.%09ld0",
+			       tm.tm_hour,
+			       tm.tm_min,
+			       tm.tm_sec,
+			       (long)ts->tv_nsec);
 		break;
 
 	// POSIX strftime() features
@@ -168,7 +194,8 @@ static int bfs_printf_strftime(FILE *file, const struct bfs_printf_directive *di
 
 /** %b: blocks */
 static int bfs_printf_b(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->st_blocks);
+	uintmax_t blocks = ((uintmax_t)ftwbuf->statbuf->blocks*BFS_STAT_BLKSIZE + 511)/512;
+	BFS_PRINTF_BUF(buf, "%ju", blocks);
 	return fprintf(file, directive->str, buf);
 }
 
@@ -179,7 +206,7 @@ static int bfs_printf_d(FILE *file, const struct bfs_printf_directive *directive
 
 /** %D: device */
 static int bfs_printf_D(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->st_dev);
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->dev);
 	return fprintf(file, directive->str, buf);
 }
 
@@ -196,13 +223,13 @@ static int bfs_printf_F(FILE *file, const struct bfs_printf_directive *directive
 
 /** %G: gid */
 static int bfs_printf_G(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->st_gid);
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->gid);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %g: group name */
 static int bfs_printf_g(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	struct group *grp = getgrgid(ftwbuf->statbuf->st_gid);
+	struct group *grp = getgrgid(ftwbuf->statbuf->gid);
 	if (!grp) {
 		return bfs_printf_G(file, directive, ftwbuf);
 	}
@@ -244,13 +271,14 @@ static int bfs_printf_H(FILE *file, const struct bfs_printf_directive *directive
 
 /** %i: inode */
 static int bfs_printf_i(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->st_ino);
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->ino);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %k: 1K blocks */
 static int bfs_printf_k(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)(ftwbuf->statbuf->st_blocks + 1)/2);
+	uintmax_t blocks = ((uintmax_t)ftwbuf->statbuf->blocks*BFS_STAT_BLKSIZE + 1023)/1024;
+	BFS_PRINTF_BUF(buf, "%ju", blocks);
 	return fprintf(file, directive->str, buf);
 }
 
@@ -272,19 +300,19 @@ static int bfs_printf_l(FILE *file, const struct bfs_printf_directive *directive
 
 /** %m: mode */
 static int bfs_printf_m(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	return fprintf(file, directive->str, (unsigned int)(ftwbuf->statbuf->st_mode & 07777));
+	return fprintf(file, directive->str, (unsigned int)(ftwbuf->statbuf->mode & 07777));
 }
 
 /** %M: symbolic mode */
 static int bfs_printf_M(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
 	char buf[11];
-	format_mode(ftwbuf->statbuf->st_mode, buf);
+	format_mode(ftwbuf->statbuf->mode, buf);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %n: link count */
 static int bfs_printf_n(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->st_nlink);
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->nlink);
 	return fprintf(file, directive->str, buf);
 }
 
@@ -304,25 +332,31 @@ static int bfs_printf_P(FILE *file, const struct bfs_printf_directive *directive
 
 /** %s: size */
 static int bfs_printf_s(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->st_size);
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->size);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %S: sparseness */
 static int bfs_printf_S(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	double sparsity = 512.0 * ftwbuf->statbuf->st_blocks / ftwbuf->statbuf->st_size;
+	double sparsity;
+	const struct bfs_stat *sb = ftwbuf->statbuf;
+	if (sb->size == 0 && sb->blocks == 0) {
+		sparsity = 1.0;
+	} else {
+		sparsity = (double)BFS_STAT_BLKSIZE*sb->blocks/sb->size;
+	}
 	return fprintf(file, directive->str, sparsity);
 }
 
 /** %U: uid */
 static int bfs_printf_U(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->st_uid);
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->uid);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %u: user name */
 static int bfs_printf_u(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	struct passwd *pwd = getpwuid(ftwbuf->statbuf->st_uid);
+	struct passwd *pwd = getpwuid(ftwbuf->statbuf->uid);
 	if (!pwd) {
 		return bfs_printf_U(file, directive, ftwbuf);
 	}
@@ -361,15 +395,17 @@ static int bfs_printf_y(FILE *file, const struct bfs_printf_directive *directive
 
 /** %Y: target type */
 static int bfs_printf_Y(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+	int error = 0;
+
 	if (ftwbuf->typeflag != BFTW_LNK) {
 		return bfs_printf_y(file, directive, ftwbuf);
 	}
 
 	const char *type = "U";
 
-	struct stat sb;
-	if (fstatat(ftwbuf->at_fd, ftwbuf->at_path, &sb, 0) == 0) {
-		type = bfs_printf_type(mode_to_typeflag(sb.st_mode));
+	struct bfs_stat sb;
+	if (bfs_stat(ftwbuf->at_fd, ftwbuf->at_path, 0, 0, &sb) == 0) {
+		type = bfs_printf_type(mode_to_typeflag(sb.mode));
 	} else {
 		switch (errno) {
 		case ELOOP:
@@ -379,10 +415,19 @@ static int bfs_printf_Y(FILE *file, const struct bfs_printf_directive *directive
 		case ENOTDIR:
 			type = "N";
 			break;
+		default:
+			type = "?";
+			error = errno;
+			break;
 		}
 	}
 
-	return fprintf(file, directive->str, type);
+	int ret = fprintf(file, directive->str, type);
+	if (error != 0) {
+		ret = -1;
+		errno = error;
+	}
+	return ret;
 }
 
 /**
@@ -411,7 +456,7 @@ static struct bfs_printf_directive *new_directive() {
 		perror("dstralloc()");
 		goto error;
 	}
-	directive->time_field = 0;
+	directive->stat_field = 0;
 	directive->c = 0;
 	directive->mtab = NULL;
 	directive->next = NULL;
@@ -584,7 +629,7 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 			switch (c) {
 			case 'a':
 				directive->fn = bfs_printf_ctime;
-				directive->time_field = ATIME;
+				directive->stat_field = BFS_STAT_ATIME;
 				command->needs_stat = true;
 				break;
 			case 'b':
@@ -593,7 +638,7 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 				break;
 			case 'c':
 				directive->fn = bfs_printf_ctime;
-				directive->time_field = CTIME;
+				directive->stat_field = BFS_STAT_CTIME;
 				command->needs_stat = true;
 				break;
 			case 'd':
@@ -611,7 +656,7 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 				if (!cmdline->mtab) {
 					cmdline->mtab = parse_bfs_mtab();
 					if (!cmdline->mtab) {
-						cfprintf(cmdline->cerr, "%{er}error: Couldn't parse the mount table: %s.%{rs}\n\n", strerror(errno));
+						cfprintf(cmdline->cerr, "%{er}error: Couldn't parse the mount table: %m%{rs}\n");
 						goto directive_error;
 					}
 				}
@@ -674,7 +719,7 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 				break;
 			case 't':
 				directive->fn = bfs_printf_ctime;
-				directive->time_field = MTIME;
+				directive->stat_field = BFS_STAT_MTIME;
 				command->needs_stat = true;
 				break;
 			case 'u':
@@ -685,6 +730,11 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 				directive->fn = bfs_printf_U;
 				command->needs_stat = true;
 				break;
+			case 'w':
+				directive->fn = bfs_printf_ctime;
+				directive->stat_field = BFS_STAT_BTIME;
+				command->needs_stat = true;
+				break;
 			case 'y':
 				directive->fn = bfs_printf_y;
 				break;
@@ -693,58 +743,30 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 				break;
 
 			case 'A':
-				directive->time_field = ATIME;
+				directive->stat_field = BFS_STAT_ATIME;
+				goto directive_strftime;
+			case 'B':
+			case 'W':
+				directive->stat_field = BFS_STAT_BTIME;
 				goto directive_strftime;
 			case 'C':
-				directive->time_field = CTIME;
+				directive->stat_field = BFS_STAT_CTIME;
 				goto directive_strftime;
 			case 'T':
-				directive->time_field = MTIME;
+				directive->stat_field = BFS_STAT_MTIME;
 				goto directive_strftime;
 
 			directive_strftime:
 				directive->fn = bfs_printf_strftime;
 				command->needs_stat = true;
 				c = *++i;
-				switch (c) {
-				case '@':
-				case 'H':
-				case 'I':
-				case 'k':
-				case 'l':
-				case 'M':
-				case 'p':
-				case 'r':
-				case 'S':
-				case 'T':
-				case '+':
-				case 'X':
-				case 'Z':
-				case 'a':
-				case 'A':
-				case 'b':
-				case 'B':
-				case 'c':
-				case 'd':
-				case 'D':
-				case 'h':
-				case 'j':
-				case 'm':
-				case 'U':
-				case 'w':
-				case 'W':
-				case 'x':
-				case 'y':
-				case 'Y':
-					directive->c = c;
-					break;
-
-				case '\0':
+				if (!c) {
 					cfprintf(cerr, "%{er}error: '%s': Incomplete time specifier '%s%c'.%{rs}\n",
 					         format, directive->str, i[-1]);
 					goto directive_error;
-
-				default:
+				} else if (strchr("%+@aAbBcCdDeFgGhHIjklmMnprRsStTuUVwWxXyYzZ", c)) {
+					directive->c = c;
+				} else {
 					cfprintf(cerr, "%{er}error: '%s': Unrecognized time specifier '%%%c%c'.%{rs}\n",
 					         format, i[-1], c);
 					goto directive_error;
@@ -806,16 +828,16 @@ error:
 }
 
 int bfs_printf(FILE *file, const struct bfs_printf *command, const struct BFTW *ftwbuf) {
-	int ret = -1;
+	int ret = 0, error = 0;
 
 	for (struct bfs_printf_directive *directive = command->directives; directive; directive = directive->next) {
 		if (directive->fn(file, directive, ftwbuf) < 0) {
-			goto done;
+			ret = -1;
+			error = errno;
 		}
 	}
 
-	ret = 0;
-done:
+	errno = error;
 	return ret;
 }
 

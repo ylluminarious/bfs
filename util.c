@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -116,6 +117,26 @@ int dup_cloexec(int fd) {
 	}
 
 	return ret;
+#endif
+}
+
+int pipe_cloexec(int pipefd[2]) {
+#if __linux__ || (BSD && !__APPLE__)
+	return pipe2(pipefd, O_CLOEXEC);
+#else
+	if (pipe(pipefd) != 0) {
+		return -1;
+	}
+
+	if (fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) == -1 || fcntl(pipefd[1], F_SETFD, FD_CLOEXEC) == -1) {
+		int error = errno;
+		close(pipefd[1]);
+		close(pipefd[0]);
+		errno = error;
+		return -1;
+	}
+
+	return 0;
 #endif
 }
 
@@ -226,15 +247,22 @@ const char *xbasename(const char *path) {
 	return i;
 }
 
-int xfstatat(int fd, const char *path, struct stat *buf, int *flags) {
-	int ret = fstatat(fd, path, buf, *flags);
+int xfaccessat(int fd, const char *path, int amode) {
+	int ret = faccessat(fd, path, amode, 0);
 
-	if (ret != 0 && !(*flags & AT_SYMLINK_NOFOLLOW) && (errno == ENOENT || errno == ENOTDIR)) {
-		*flags |= AT_SYMLINK_NOFOLLOW;
-		ret = fstatat(fd, path, buf, *flags);
+#ifdef AT_EACCESS
+	// Some platforms, like Hurd, only support AT_EACCESS.  Other platforms,
+	// like Android, don't support AT_EACCESS at all.
+	if (ret != 0 && (errno == EINVAL || errno == ENOTSUP)) {
+		ret = faccessat(fd, path, amode, AT_EACCESS);
 	}
+#endif
 
 	return ret;
+}
+
+bool is_nonexistence_error(int error) {
+	return error == ENOENT || errno == ENOTDIR;
 }
 
 enum bftw_typeflag mode_to_typeflag(mode_t mode) {

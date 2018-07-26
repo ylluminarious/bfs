@@ -15,18 +15,20 @@
 ############################################################################
 
 ifeq ($(wildcard .git),)
-VERSION := 1.1.1
+VERSION := 1.2.3
 else
 VERSION := $(shell git describe --always)
 endif
 
 CC ?= gcc
+INSTALL ?= install
+MKDIR ?= mkdir -p
+RM ?= rm -f
+
 WFLAGS ?= -Wall -Wmissing-declarations
 CFLAGS ?= -g $(WFLAGS)
 LDFLAGS ?=
 DEPFLAGS ?= -MD -MP -MF $(@:.o=.d)
-RM ?= rm -f
-INSTALL ?= install
 
 DESTDIR ?=
 PREFIX ?= /usr
@@ -49,10 +51,13 @@ ALL_LDFLAGS = $(ALL_CFLAGS) $(LDFLAGS)
 
 all: bfs
 
-bfs: bftw.o color.o dstring.o eval.o exec.o main.o mtab.o parse.o printf.o typo.o util.o
+bfs: bftw.o color.o dstring.o eval.o exec.o main.o mtab.o opt.o parse.o printf.o stat.o typo.o util.o
 	$(CC) $(ALL_LDFLAGS) $^ -o $@
 
-release: CFLAGS := -O3 -flto $(WFLAGS) -DNDEBUG -g
+sanitized: CFLAGS := -g $(WFLAGS) -fsanitize=address -fsanitize=undefined
+sanitized: bfs
+
+release: CFLAGS := -g $(WFLAGS) -O3 -flto -DNDEBUG
 release: bfs
 
 %.o: %.c
@@ -65,7 +70,10 @@ clean:
 	$(RM) bfs *.o *.d
 
 install:
-	$(INSTALL) -D -m755 bfs $(DESTDIR)$(PREFIX)/bin/bfs
+	$(MKDIR) $(DESTDIR)$(PREFIX)/bin
+	$(INSTALL) -m755 bfs $(DESTDIR)$(PREFIX)/bin/bfs
+	$(MKDIR) $(DESTDIR)$(PREFIX)/share/man/man1
+	$(INSTALL) -m644 bfs.1 $(DESTDIR)$(PREFIX)/share/man/man1/bfs.1
 
 uninstall:
 	$(RM) $(DESTDIR)$(PREFIX)/bin/bfs

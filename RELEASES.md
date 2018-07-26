@@ -2,6 +2,86 @@
 ===
 
 
+1.2.3
+-----
+
+**July 15, 2018**
+
+- Fixed `test_depth_error` on filesystems that don't fill in `d_type`
+- Fixed the build on Linux architectures that don't have the `statx()` syscall (ia64, sh4)
+- Fixed use of AT_EMPTY_PATH for fstatat on systems that don't support it (Hurd)
+- Fixed `ARG_MAX` accounting on architectures with large pages (ppc64le)
+- Fixed the build against the upcoming glibc 2.28 release that includes its own `statx()` wrapper
+
+
+1.2.2
+-----
+
+**June 23, 2018**
+
+- Minor bug fixes:
+  - Fixed `-exec ... '{}' +` argument size tracking after recovering from `E2BIG`
+  - Fixed `-fstype` if `/proc` is available but `/etc/mtab` is not
+  - Fixed an uninitialized variable when given `-perm +rw...`
+  - Fixed some potential "error: 'path': Success" messages
+- Reduced reliance on GNU coreutils in the testsuite
+- Refactored and simplified the internals of `bftw()`
+
+
+1.2.1
+-----
+
+**February 8, 2018**
+
+- Performance optimizations
+
+
+1.2
+---
+
+**January 20, 2018**
+
+- Added support for the `-perm +7777` syntax deprecated by GNU find (equivalent to `-perm /7777`), for compatibility with BSD finds
+- Added support for file birth/creation times on platforms that report it
+  - `-Bmin`/`-Btime`/`-Bnewer`
+  - `B` flag for `-newerXY`
+  - `%w` and `%Wk` directives for `-printf`
+  - Uses the `statx(2)` system call on new enough Linux kernels
+- More robustness to `E2BIG` added to the `-exec` implementation
+
+
+1.1.4
+-----
+
+**October 27, 2017**
+
+- Added a man page
+- Fixed cases where multiple actions write to the same file
+- Report errors that occur when closing files/flushing streams
+- Fixed "argument list too long" errors with `-exec ... '{}' +`
+
+
+1.1.3
+-----
+
+**October 4, 2017**
+
+- Refactored the optimizer
+- Implemented data flow optimizations
+
+
+1.1.2
+-----
+
+**September 10, 2017**
+
+- Fixed `-samefile` and similar predicates when passed broken symbolic links
+- Implemented `-fstype` on Solaris
+- Fixed `-fstype` under musl
+- Implemented `-D search`
+- Implemented a cost-based optimizer
+
+
 1.1.1
 -----
 
