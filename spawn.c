@@ -18,6 +18,7 @@
 #include "util.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -103,13 +104,25 @@ static int bfs_execvpe(const char *exe, char **argv, char **envp) {
 #endif
 }
 
+/** Holder for bfs_spawn_exec() arguments. */
+struct bfs_spawn_args {
+	const char *exe;
+	const struct bfs_spawn *ctx;
+	char **argv;
+	char **envp;
+	int *pipefd;
+};
+
 /** Actually exec() the new process. */
-static void bfs_spawn_exec(const char *exe, const struct bfs_spawn *ctx, char **argv, char **envp, int pipefd[2]) {
-	int error;
+static int bfs_spawn_exec(void *ptr) {
+	const struct bfs_spawn_args *args = ptr;
+
+	const struct bfs_spawn *ctx = args->ctx;
 	enum bfs_spawn_flags flags = ctx ? ctx->flags : 0;
 	const struct bfs_spawn_action *actions = ctx ? ctx->actions : NULL;
 
-	close(pipefd[0]);
+	close(args->pipefd[0]);
+	int pipefd = args->pipefd[1];
 
 	for (const struct bfs_spawn_action *action = actions; action; action = action->next) {
 		switch (action->op) {
@@ -122,16 +135,45 @@ static void bfs_spawn_exec(const char *exe, const struct bfs_spawn *ctx, char **
 	}
 
 	if (flags & BFS_SPAWN_USEPATH) {
-		bfs_execvpe(exe, argv, envp);
+		bfs_execvpe(args->exe, args->argv, args->envp);
 	} else {
-		execve(exe, argv, envp);
+		execve(args->exe, args->argv, args->envp);
 	}
 
+	int error;
 fail:
 	error = errno;
-	while (write(pipefd[1], &error, sizeof(error)) < sizeof(error));
-	close(pipefd[1]);
-	_Exit(127);
+	while (write(pipefd, &error, sizeof(error)) < sizeof(error));
+	close(pipefd);
+	return 127;
+}
+
+/** fork() or clone() a process, whatever's available. */
+static pid_t bfs_clone(int (*fn)(void *ptr), void *ptr) {
+#if __linux__
+	char stack[4096];
+	int flags = CLONE_VFORK | CLONE_VM | SIGCHLD;
+
+#if __ia64__
+	pid_t ret = __clone2(fn, stack, sizeof(stack), flags, ptr, NULL, NULL, NULL);
+#else
+	pid_t ret = clone(fn, stack + sizeof(stack), flags, ptr, NULL, NULL, NULL);
+#endif
+	return ret;
+
+#else // !__linux__
+
+	pid_t ret = fork();
+	if (ret < 0) {
+		return -1;
+	} else if (ret == 0) {
+		// Child
+		_Exit(fn(ptr));
+	} else {
+		// Parent
+		return ret;
+	}
+#endif
 }
 
 pid_t bfs_spawn(const char *exe, const struct bfs_spawn *ctx, char **argv, char **envp) {
@@ -141,21 +183,24 @@ pid_t bfs_spawn(const char *exe, const struct bfs_spawn *ctx, char **argv, char 
 		return -1;
 	}
 
-	int error;
-	pid_t pid = fork();
+	struct bfs_spawn_args args = {
+		.exe = exe,
+		.ctx = ctx,
+		.argv = argv,
+		.envp = envp,
+		.pipefd = pipefd,
+	};
+	pid_t pid = bfs_clone(bfs_spawn_exec, &args);
 
+	int error;
 	if (pid < 0) {
 		error = errno;
 		close(pipefd[1]);
 		close(pipefd[0]);
 		errno = error;
 		return -1;
-	} else if (pid == 0) {
-		// Child
-		bfs_spawn_exec(exe, ctx, argv, envp, pipefd);
 	}
 
-	// Parent
 	close(pipefd[1]);
 
 	ssize_t nbytes = read(pipefd[0], &error, sizeof(error));
