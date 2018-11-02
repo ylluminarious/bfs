@@ -628,7 +628,7 @@ static void bftw_queue_init(struct bftw_queue *queue) {
 	queue->tail = NULL;
 }
 
-/** Add a directory to the bftw_queue. */
+/** Add a directory to the tail of the bftw_queue. */
 static void bftw_queue_push(struct bftw_queue *queue, struct bftw_dir *dir) {
 	assert(dir->next == NULL);
 
@@ -641,7 +641,22 @@ static void bftw_queue_push(struct bftw_queue *queue, struct bftw_dir *dir) {
 	queue->tail = dir;
 }
 
-/** Pop the next directory from the queue. */
+/** Prepend a queue to the head of another one. */
+static void bftw_queue_prepend(struct bftw_queue *head, struct bftw_queue *tail) {
+	if (head->tail) {
+		head->tail->next = tail->head;
+	}
+	if (head->head) {
+		tail->head = head->head;
+	}
+	if (!tail->tail) {
+		tail->tail = head->tail;
+	}
+	head->head = NULL;
+	head->tail = NULL;
+}
+
+/** Pop the next directory from the head of the queue. */
 static struct bftw_dir *bftw_queue_pop(struct bftw_queue *queue) {
 	struct bftw_dir *dir = queue->head;
 	queue->head = dir->next;
@@ -777,6 +792,8 @@ struct bftw_state {
 	struct bftw_cache cache;
 	/** The queue of directories left to explore. */
 	struct bftw_queue queue;
+	/** An intermediate queue used for depth-first searches. */
+	struct bftw_queue prequeue;
 
 	/** The reader for the current directory. */
 	struct bftw_reader reader;
@@ -814,6 +831,7 @@ static int bftw_state_init(struct bftw_state *state, const char *root, bftw_fn *
 	}
 
 	bftw_queue_init(&state->queue);
+	bftw_queue_init(&state->prequeue);
 
 	if (bftw_reader_init(&state->reader) != 0) {
 		goto err_cache;
@@ -1003,7 +1021,11 @@ static int bftw_push(struct bftw_state *state, const char *name) {
 		dir->ino = statbuf->ino;
 	}
 
-	bftw_queue_push(&state->queue, dir);
+	if (state->flags & BFTW_DFS) {
+		bftw_queue_push(&state->prequeue, dir);
+	} else {
+		bftw_queue_push(&state->queue, dir);
+	}
 	return 0;
 }
 
@@ -1011,6 +1033,14 @@ static int bftw_push(struct bftw_state *state, const char *name) {
  * Pop a directory from the queue and start reading it.
  */
 static struct bftw_reader *bftw_pop(struct bftw_state *state) {
+	if (state->flags & BFTW_DFS) {
+		bftw_queue_prepend(&state->prequeue, &state->queue);
+	}
+
+	if (!state->queue.head) {
+		return NULL;
+	}
+
 	struct bftw_reader *reader = &state->reader;
 	struct bftw_dir *dir = bftw_queue_pop(&state->queue);
 	bftw_reader_open(reader, &state->cache, dir);
@@ -1085,6 +1115,16 @@ static enum bftw_action bftw_release_reader(struct bftw_state *state, bool do_vi
 }
 
 /**
+ * Drain all the entries from a bftw_queue.
+ */
+static void bftw_drain_queue(struct bftw_state *state, struct bftw_queue *queue) {
+	while (queue->head) {
+		struct bftw_dir *dir = bftw_queue_pop(queue);
+		bftw_release_dir(state, dir, false);
+	}
+}
+
+/**
  * Dispose of the bftw() state.
  *
  * @return
@@ -1097,11 +1137,8 @@ static int bftw_state_destroy(struct bftw_state *state) {
 	}
 	bftw_reader_destroy(reader);
 
-	struct bftw_queue *queue = &state->queue;
-	while (queue->head) {
-		struct bftw_dir *dir = bftw_queue_pop(queue);
-		bftw_release_dir(state, dir, false);
-	}
+	bftw_drain_queue(state, &state->prequeue);
+	bftw_drain_queue(state, &state->queue);
 
 	bftw_cache_destroy(&state->cache);
 
@@ -1138,8 +1175,11 @@ int bftw(const char *path, bftw_fn *fn, int nopenfd, enum bftw_flags flags, void
 		goto done;
 	}
 
-	while (state.queue.head) {
+	while (true) {
 		struct bftw_reader *reader = bftw_pop(&state);
+		if (!reader) {
+			break;
+		}
 
 		while (reader->de) {
 			const char *name = reader->de->d_name;

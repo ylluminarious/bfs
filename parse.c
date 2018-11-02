@@ -2098,6 +2098,16 @@ static struct expr *parse_samefile(struct parser_state *state, int arg1, int arg
 }
 
 /**
+ * Parse -bfs, -dfs.
+ */
+static struct expr *parse_search_strategy(struct parser_state *state, int flag, int arg2) {
+	struct cmdline *cmdline = state->cmdline;
+	cmdline->flags &= ~BFTW_DFS;
+	cmdline->flags |= flag;
+	return parse_nullary_flag(state);
+}
+
+/**
  * Parse -size N[cwbkMGTP]?.
  */
 static struct expr *parse_size(struct parser_state *state, int arg1, int arg2) {
@@ -2585,6 +2595,7 @@ static const struct table_entry parse_table[] = {
 	{"-and"},
 	{"-anewer", false, parse_newer, BFS_STAT_ATIME},
 	{"-atime", false, parse_time, BFS_STAT_ATIME, DAYS},
+	{"-bfs", false, parse_search_strategy, 0},
 	{"-capable", false, parse_capable},
 	{"-cmin", false, parse_time, BFS_STAT_CTIME, MINUTES},
 	{"-cnewer", false, parse_newer, BFS_STAT_CTIME},
@@ -2594,6 +2605,7 @@ static const struct table_entry parse_table[] = {
 	{"-daystart", false, parse_daystart},
 	{"-delete", false, parse_delete},
 	{"-depth", false, parse_depth_n},
+	{"-dfs", false, parse_search_strategy, BFTW_DFS},
 	{"-empty", false, parse_empty},
 	{"-exec", false, parse_exec, 0},
 	{"-execdir", false, parse_exec, BFS_EXEC_CHDIR},
@@ -2991,6 +3003,12 @@ void dump_cmdline(const struct cmdline *cmdline, bool verbose) {
 
 	cfprintf(cerr, "${ex}%s${rs} ", cmdline->argv[0]);
 
+	if (cmdline->flags & BFTW_DFS) {
+		cfprintf(cerr, "${cyn}-dfs${rs} ");
+	} else {
+		cfprintf(cerr, "${cyn}-bfs${rs} ");
+	}
+
 	if (cmdline->flags & BFTW_LOGICAL) {
 		cfprintf(cerr, "${cyn}-L${rs} ");
 	} else if (cmdline->flags & BFTW_COMFOLLOW) {
@@ -3161,6 +3179,11 @@ struct cmdline *parse_cmdline(int argc, char *argv[]) {
 		.depth_arg = NULL,
 		.prune_arg = NULL,
 	};
+
+	if (strcmp(xbasename(state.command), "find") == 0) {
+		// Operate depth-first when invoked as "find"
+		cmdline->flags |= BFTW_DFS;
+	}
 
 	if (parse_gettime(&state.now) != 0) {
 		goto fail;

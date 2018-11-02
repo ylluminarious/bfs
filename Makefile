@@ -91,8 +91,9 @@ release: bfs
 %.o: %.c
 	$(CC) $(ALL_CFLAGS) -c $< -o $@
 
-check: all
-	./tests.sh
+check: bfs
+	./tests.sh --bfs="$(realpath $<)"
+	./tests.sh --bfs="$(realpath $<) -dfs"
 
 clean:
 	$(RM) bfs *.o *.d

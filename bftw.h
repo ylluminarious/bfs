@@ -141,14 +141,15 @@ enum bftw_flags {
 	BFTW_DETECT_CYCLES = 1 << 5,
 	/** Stay on the same filesystem. */
 	BFTW_XDEV          = 1 << 6,
+	/** Search depth-first. */
+	BFTW_DFS           = 1 << 7,
 };
 
 /**
  * Breadth First Tree Walk (or Better File Tree Walk).
  *
  * Like ftw(3) and nftw(3), this function walks a directory tree recursively,
- * and invokes a callback for each path it encounters.  However, bftw() operates
- * breadth-first.
+ * and invokes a callback for each path it encounters.
  *
  * @param path
  *         The starting path.
